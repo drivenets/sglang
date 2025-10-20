@@ -558,11 +558,39 @@ def apply_fp8_linear(
 
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[1]]
+    # For AITER, weight is pre-transposed to [N, K], so output dim is shape[0]
+    weight_output_dim = weight.shape[0] if _use_aiter else weight.shape[1]
+    output_shape = [*input.shape[:-1], weight_output_dim]
 
     if compressed_tensor_quant:
-        # cutlass_scaled_mm supports per tensor/channel W and per tensor/token A
-        # for sgl-kernel fp8_scaled_mm, it support per channel W now
+        # Try AITER per-channel GEMM first (fastest on MI300X/MI355X)
+        # Note: AITER weights are pre-transposed to [N, K], so check shape[0]
+        weight_out_dim = weight.shape[0] if _use_aiter else weight.shape[1]
+        if _use_aiter and weight_scale.numel() == weight_out_dim:
+            # Use AITER's optimized per-channel FP8 GEMM
+            # AITER per-channel requires per-token activation quantization
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                use_per_token_if_dynamic=True,  # Force per-token for AITER
+            )
+            
+            # Reshape scales for AITER (expects [M,1] and [1,N])
+            x_scale_aiter = x_scale.view(-1, 1)
+            w_scale_aiter = weight_scale.view(1, -1)
+            
+            # AITER gemm_a8w8_bpreshuffle expects: XQ: [M, K], WQ: [N, K] (shuffled)
+            # Weight should already be shuffled during loading (see fp8.py line 382)
+            output = gemm_a8w8_bpreshuffle(
+                qinput, weight, x_scale_aiter, w_scale_aiter, bias=None, dtype=input.dtype
+            )
+            
+            if bias is not None:
+                output = output + bias
+            # AITER returns output directly, view to correct shape
+            return output.view(*output_shape)
+        
+        # Fall back to cutlass/triton
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             qinput, x_scale = scaled_fp8_quant(
                 input_2d,
@@ -651,6 +679,10 @@ def apply_fp8_linear(
                 # per-token scale quant for input matrix, every row(one token) have one scale factor
                 # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
                 if _use_aiter:
+                    # DEBUG: Log that we're using AIter
+                    import logging
+                    logger = logging.getLogger("sglang")
+                    logger.info(f"✓ USING AITER GEMM: shape M={qinput.shape[0]}, N={weight.shape[0]}, K={weight.shape[1]}")
                     # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
                     # XQ -> input tensor, shape = (m, k)
                     # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf
@@ -783,7 +815,7 @@ def apply_fp8_linear(
         # so fallback to naive if per channel or per token
         per_tensor_weights = weight_scale.numel() == 1
         per_tensor_activations = x_scale.numel() == 1
-
+        
         if per_tensor_weights and per_tensor_activations:
             # Fused GEMM_DQ
             output = torch._scaled_mm(
