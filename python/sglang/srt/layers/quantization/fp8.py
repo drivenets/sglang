@@ -390,9 +390,9 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.cutlass_fp8_supported or self.use_marlin or _use_aiter:
                     # apply per-channel quantization default as
-                    # cutlass sgl-kernel and marlin only support per-channel scale
+                    # cutlass sgl-kernel, marlin, and AITER only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
                         layer.weight, layer.weight.shape[-1]
                     )
@@ -402,7 +402,12 @@ class Fp8LinearMethod(LinearMethodBase):
                     qweight, weight_scale = input_to_float8(layer.weight)
 
                 # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
+                # For AITER: shuffle weights for bpreshuffle kernel (special memory layout)
+                if _use_aiter and shuffle_weight is not None:
+                    qweight_shuffled = shuffle_weight(qweight, layout=(16, 16))
+                    layer.weight = Parameter(qweight_shuffled, requires_grad=False)
+                else:
+                    layer.weight = Parameter(qweight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
 
@@ -522,6 +527,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        # Enable compressed_tensor_quant for AITER per-channel path
+        # Note: AITER weights are pre-shuffled to [N, K], so check shape[0]
+        weight_dim_to_check = layer.weight.shape[0] if _use_aiter else layer.weight.shape[1]
+        use_compressed = _use_aiter and layer.weight_scale.numel() == weight_dim_to_check
+        
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
@@ -530,6 +540,7 @@ class Fp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
+            compressed_tensor_quant=use_compressed,
         )
 
 
