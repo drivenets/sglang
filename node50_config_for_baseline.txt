@@ -1,0 +1,8 @@
+Repository: https://github.com/sgl-project/sglang.git
+Commit: b4c3728d17c0e0c0175922247439f9fae3d35a66
+Date: 2025-10-20 07:37:58 -0500
+Message: Fix FP8 attention routing to use AITER on AMD MI355X
+Repository: https://github.com/sgl-project/sglang.git
+Commit: b4c3728d17c0e0c0175922247439f9fae3d35a66
+Date: 2025-10-20 07:37:58 -0500
+Message: Fix FP8 attention routing to use AITER on AMD MI355X

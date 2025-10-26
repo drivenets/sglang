@@ -41,7 +41,10 @@ if _is_cuda:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
+    try:
+        from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
+    except ImportError:
+        vllm_ops = None  # Not using vllm, will use AITER instead
 
     if _use_aiter:
         try:
