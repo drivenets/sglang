@@ -266,11 +266,27 @@ def aiter_w8a8_block_fp8_linear(
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    
+    # OPTIMIZATION: Pad M to power-of-2 for tuned kernels (eliminates UNTUNED calls)
+    M_orig, K = input_2d.shape
+    M_is_pow2 = (M_orig & (M_orig - 1)) == 0 and M_orig > 0
+    
+    if not M_is_pow2 and M_orig > 0:
+        # Pad to next power of 2
+        M_padded = 1 << (M_orig - 1).bit_length()
+        pad_size = M_padded - M_orig
+        input_2d_padded = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_size), value=0.0)
+    else:
+        input_2d_padded = input_2d
+        pad_size = 0
 
-    q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
-    output = gemm_a8w8_blockscale(
+    q_input, x_scale = aiter_per1x128_quant(input_2d_padded, quant_dtype=aiter.dtypes.fp8)
+    output_padded = gemm_a8w8_blockscale(
         q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
+    
+    # Slice back to original M
+    output = output_padded[:M_orig, :] if pad_size > 0 else output_padded
 
     if bias is not None:
         output += bias
