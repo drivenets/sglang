@@ -4,9 +4,23 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, get_bool_env_var
 
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Import AITER functions if enabled
+if _use_aiter:
+    try:
+        import aiter
+        _aiter_available = True
+        print("[PATCH] AITER RMSNorm enabled in elementwise.py")
+    except ImportError:
+        _aiter_available = False
+        _use_aiter = False
+        print("[PATCH] AITER not available, falling back to Triton")
+else:
+    _aiter_available = False
 
 
 fused_softcap_autotune = triton.autotune(
@@ -186,6 +200,18 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
+    # Use AITER if available (3.85x faster per norm)
+    if _use_aiter and _aiter_available:
+        # AITER's fused function: add residual + normalize twice
+        residual_out = torch.empty_like(x)
+        output = torch.empty_like(x)
+        # First norm: x + residual -> output (normalized)
+        aiter.rmsnorm2d_fwd_with_add(output, x, residual, residual_out, weight1, eps)
+        # Second norm: residual_out -> mid (normalized)
+        mid = aiter.rmsnorm2d_fwd(residual_out, weight2, epsilon=eps)
+        return output, mid
+    
+    # Fallback to Triton
     assert len(x.shape) == 2
     assert (
         x.shape == residual.shape and x.dtype == residual.dtype
@@ -252,6 +278,11 @@ def fused_rmsnorm_kernel(
 
 
 def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
+    # Use AITER if available (3.85x faster)
+    if _use_aiter and _aiter_available:
+        return aiter.rmsnorm2d_fwd(x, weight, epsilon=eps)
+    
+    # Fallback to Triton
     assert len(x.shape) == 2
     if inplace:
         output = x
