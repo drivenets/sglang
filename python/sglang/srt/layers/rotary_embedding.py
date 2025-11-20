@@ -110,14 +110,17 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
+        self.vllm_rotary_embedding = None
         if (
             (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu and _is_cpu_amx_available)
             and not _is_xpu
         ):
-            from vllm._custom_ops import rotary_embedding
-
-            self.vllm_rotary_embedding = rotary_embedding
+            try:
+                from vllm._custom_ops import rotary_embedding
+                self.vllm_rotary_embedding = rotary_embedding
+            except (ImportError, ModuleNotFoundError):
+                pass  # vllm not available
 
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -272,14 +275,18 @@ class RotaryEmbedding(CustomOp):
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for vllm_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
-            self.vllm_rotary_embedding(
-                positions,
-                query,
-                key,
-                self.head_size,
-                self.cos_sin_cache,
-                self.is_neox_style,
-            )
+            if self.vllm_rotary_embedding is not None:
+                self.vllm_rotary_embedding(
+                    positions,
+                    query,
+                    key,
+                    self.head_size,
+                    self.cos_sin_cache,
+                    self.is_neox_style,
+                )
+            else:
+                # Fall back to native implementation
+                return self.forward_native(positions, query, key, offsets, fused_set_kv_buffer_arg)
         return query, key
 
     def extra_repr(self) -> str:
@@ -1715,6 +1722,19 @@ def get_rope(
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
 ) -> RotaryEmbedding:
+    # Use AITER's rotary embedding when enabled
+    if _use_aiter:
+        return aiter_get_rope(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            rope_scaling,
+            dtype,
+            partial_rotary_factor,
+        )
+    
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_scaling is not None:
@@ -2100,3 +2120,6 @@ def get_rope_wrapper(
         partial_rotary_factor,
         device,
     )
+
+# Make get_rope use the wrapper so AITER is used when enabled
+get_rope = get_rope_wrapper

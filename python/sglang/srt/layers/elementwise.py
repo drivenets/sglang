@@ -8,13 +8,17 @@ from sglang.srt.utils import is_hip, get_bool_env_var
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_aiter_rmsnorm = get_bool_env_var("DISABLE_AITER_RMSNORM")
 
 # Import AITER functions if enabled
 if _use_aiter:
     try:
         import aiter
         _aiter_available = True
-        print("[PATCH] AITER RMSNorm enabled in elementwise.py")
+        if _disable_aiter_rmsnorm:
+            print("[PATCH] AITER RMSNorm DISABLED (workaround for value explosion bug)")
+        else:
+            print("[PATCH] AITER RMSNorm enabled in elementwise.py")
     except ImportError:
         _aiter_available = False
         _use_aiter = False
@@ -200,8 +204,8 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
-    # Use AITER if available (3.85x faster per norm)
-    if _use_aiter and _aiter_available:
+    # Use AITER if available (3.85x faster per norm) but only if not disabled
+    if _use_aiter and _aiter_available and not _disable_aiter_rmsnorm:
         # AITER's fused function: add residual + normalize twice
         residual_out = torch.empty_like(x)
         output = torch.empty_like(x)
@@ -278,8 +282,8 @@ def fused_rmsnorm_kernel(
 
 
 def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
-    # Use AITER if available (3.85x faster)
-    if _use_aiter and _aiter_available:
+    # Use AITER if available (3.85x faster) but only if not disabled
+    if _use_aiter and _aiter_available and not _disable_aiter_rmsnorm:
         return aiter.rmsnorm2d_fwd(x, weight, epsilon=eps)
     
     # Fallback to Triton
