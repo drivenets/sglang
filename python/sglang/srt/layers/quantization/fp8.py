@@ -222,18 +222,14 @@ class Fp8LinearMethod(LinearMethodBase):
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
 
-        # Enable block quantization if:
-        # 1. Explicitly configured via weight_block_size, OR
-        # 2. Using AITER blockscale (2D block quant)
+        # Block quantization is for pre-quantized checkpoints
+        self.block_quant = self.quant_config.weight_block_size is not None
+
+        # AITER blockscale: quantize on-the-fly with 2D blocks (not pre-quantized)
         self.use_aiter_blockscale = (_is_hip and _use_aiter and 
                                      get_bool_env_var("SGLANG_FP8_USE_BLOCKSCALE"))
-        self.block_quant = (self.quant_config.weight_block_size is not None or 
-                           self.use_aiter_blockscale)
-
-        # Set block size for AITER blockscale if not already set
-        if self.use_aiter_blockscale and self.quant_config.weight_block_size is None:
-            self.quant_config.weight_block_size = [128, 128]
-            log_info_on_rank0("[AITER BLOCKSCALE] Using 2D block quantization: 128x128")
+        if self.use_aiter_blockscale:
+            print("[AITER BLOCKSCALE] Will use 2D block quantization (128x128) for weight quant")
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -412,7 +408,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     qweight, weight_scale = quantize_weight_2d_blocks_fp8(
                         layer.weight, block_n=128, block_k=128
                     )
-                    log_info_on_rank0(
+                    print(
                         f"[AITER 2D BLOCK QUANT] weight shape: {qweight.shape}, "
                         f"scale shape: {weight_scale.shape}"
                     )
@@ -528,6 +524,22 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        # Check if using 2D block scales (blockscale kernel)
+        use_blockscale = (hasattr(layer, 'weight_scale') and 
+                         layer.weight_scale.ndim == 2 and
+                         self.use_aiter_blockscale)
+        
+        if use_blockscale:
+            # Use blockscale path with 2D scales
+            return self.w8a8_block_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                block_size=self.quant_config.weight_block_size,
+                weight_scale=layer.weight_scale,  # 2D scales, no _inv suffix
+                input_scale=None,
+                bias=bias,
+            )
+        
         if self.block_quant:
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
