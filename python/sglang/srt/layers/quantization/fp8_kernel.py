@@ -37,6 +37,55 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
+
+def quantize_weight_2d_blocks_fp8(
+    weight: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantizes weights into 2D blocks (e.g., 128x128) for FP8.
+    
+    Args:
+        weight: Weight tensor of shape (N, K) in FP16/BF16
+        block_n: Block size for N dimension (default: 128)
+        block_k: Block size for K dimension (default: 128)
+    
+    Returns:
+        qweight: Quantized weight tensor of shape (N, K) in FP8
+        scales: Scale tensor of shape (scale_n, scale_k) in FP32
+            where scale_n = ceil(N / block_n), scale_k = ceil(K / block_k)
+    """
+    N, K = weight.shape
+    scale_n = (N + block_n - 1) // block_n
+    scale_k = (K + block_k - 1) // block_k
+    
+    # Create output tensors
+    qweight = torch.empty_like(weight, dtype=fp8_dtype)
+    scales = torch.zeros((scale_n, scale_k), dtype=torch.float32, device=weight.device)
+    
+    # Quantize each block
+    for i in range(scale_n):
+        for j in range(scale_k):
+            n_start = i * block_n
+            n_end = min((i + 1) * block_n, N)
+            k_start = j * block_k
+            k_end = min((j + 1) * block_k, K)
+            
+            # Extract block
+            block = weight[n_start:n_end, k_start:k_end]
+            
+            # Compute scale for this block
+            amax = block.abs().max().float().clamp(min=1e-12)
+            scale = fp8_max / amax
+            scales[i, j] = 1.0 / scale  # Store reciprocal for dequant
+            
+            # Quantize block
+            block_q = (block.float() * scale).clamp(min=fp8_min, max=fp8_max)
+            qweight[n_start:n_end, k_start:k_end] = block_q.to(fp8_dtype)
+    
+    return qweight, scales
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
