@@ -899,13 +899,41 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
                 requires_grad=False,
             )
-            for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+            
+            # FP8 FIX: Use per-channel quantization for AITER instead of per-expert
+            if _use_aiter:
+                from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
+                
+                for expert in range(layer.num_local_experts):
+                    # Per-channel quantization for w13
+                    w13_expert = layer.w13_weight.data[expert, :, :]  # [2*inter_dim, hidden]
+                    w13_weight[expert, :, :], w13_scale_pc = per_token_group_quant_fp8(
+                        w13_expert, w13_expert.shape[-1]
+                    )
+                    # Store per-channel scales in weight_scale1
+                    layer.w13_weight_scale1[expert, :] = w13_scale_pc.squeeze()
+                    # Store max scale for compatibility
+                    layer.w13_weight_scale[expert] = w13_scale_pc.max()
+                    
+                    # Per-channel quantization for w2
+                    w2_expert = layer.w2_weight.data[expert, :, :]  # [hidden, inter_dim]
+                    w2_weight[expert, :, :], w2_scale_pc = per_token_group_quant_fp8(
+                        w2_expert, w2_expert.shape[-1]
+                    )
+                    # Store per-channel scales
+                    layer.w2_weight_scale1[expert, :] = w2_scale_pc.squeeze()
+                    # Store max scale for compatibility
+                    layer.w2_weight_scale[expert] = w2_scale_pc.max()
+            else:
+                # Original per-expert quantization for non-AITER
+                for expert in range(layer.num_local_experts):
+                    w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                        scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                    )
+                    w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                        scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                    )
+                    
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
