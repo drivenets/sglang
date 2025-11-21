@@ -584,6 +584,18 @@ def apply_fp8_linear(
         # Try AITER per-channel GEMM first (fastest on MI300X/MI355X)
         # Note: AITER weights are pre-transposed to [N, K], so check shape[0]
         weight_out_dim = weight.shape[0] if _use_aiter else weight.shape[1]
+        
+        # DEBUG: Log compressed path entry
+        if not hasattr(apply_fp8_linear, '_logged_compressed'):
+            apply_fp8_linear._logged_compressed = True
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[FP8 COMPRESSED] Entered compressed_tensor_quant path")
+            logger.info(f"  weight: {weight.shape}, weight_scale: {weight_scale.shape}")
+            logger.info(f"  _use_aiter: {_use_aiter}, weight_out_dim: {weight_out_dim}")
+            logger.info(f"  weight_scale.numel(): {weight_scale.numel()}")
+            logger.info(f"  Condition result: {_use_aiter and weight_scale.numel() == weight_out_dim}")
+        
         if _use_aiter and weight_scale.numel() == weight_out_dim:
             # Use AITER's optimized per-channel FP8 GEMM
             # AITER per-channel requires per-token activation quantization
