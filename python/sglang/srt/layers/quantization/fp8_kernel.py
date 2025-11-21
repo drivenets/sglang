@@ -46,6 +46,11 @@ def quantize_weight_2d_blocks_fp8(
     """
     Quantizes weights into 2D blocks (e.g., 128x128) for FP8.
     
+    CRITICAL: AITER uses 448 (fp8_max * 2) as the quantization range!
+    - Quantization: q = weight * (448 / amax)
+    - Dequantization: weight = q * (amax / 448)
+    - Scale stored: amax / 448
+    
     Args:
         weight: Weight tensor of shape (N, K) in FP16/BF16
         block_n: Block size for N dimension (default: 128)
@@ -59,6 +64,9 @@ def quantize_weight_2d_blocks_fp8(
     N, K = weight.shape
     scale_n = (N + block_n - 1) // block_n
     scale_k = (K + block_k - 1) // block_k
+    
+    # AITER uses 2 * fp8_max = 448 as quantization range
+    quant_range = fp8_max * 2.0  # 448.0
     
     # Create output tensors
     qweight = torch.empty_like(weight, dtype=fp8_dtype)
@@ -81,14 +89,13 @@ def quantize_weight_2d_blocks_fp8(
             # Compute scale for this block
             amax = block.abs().max().float().clamp(min=1e-12)
             
-            # Try direct scale instead of reciprocal
-            # The Triton kernel multiplies by scale to dequantize
-            # So if q = x / amax * fp8_max, then x = q * amax / fp8_max
-            scale_factor = amax / fp8_max  # This is what kernel should multiply by
+            # AITER quantization: q = weight * (448 / amax)
+            # Dequantization scale: amax / 448
+            scale_factor = amax / quant_range
             scales[i, j] = scale_factor
             
-            # Quantize: q = x * (fp8_max / amax)
-            block_q = (block.float() / amax * fp8_max).clamp(min=fp8_min, max=fp8_max)
+            # Quantize: q = weight * (448 / amax)
+            block_q = (block.float() / amax * quant_range).clamp(min=fp8_min, max=fp8_max)
             qweight[n_start:n_end, k_start:k_end] = block_q.to(fp8_dtype)
             
             scale_values.append(scale_factor.item())
@@ -97,7 +104,7 @@ def quantize_weight_2d_blocks_fp8(
     if len(scale_values) > 0:
         import logging
         logger = logging.getLogger(__name__)
-        logger.info(f"[FP8 BLOCK QUANT DEBUG] weight shape: {weight.shape}, "
+        logger.info(f"[FP8 BLOCK QUANT] weight shape: {weight.shape}, "
                    f"scale shape: {scales.shape}, "
                    f"scale range: [{min(scale_values):.6f}, {max(scale_values):.6f}], "
                    f"scale mean: {sum(scale_values)/len(scale_values):.6f}")
