@@ -605,9 +605,13 @@ def apply_fp8_linear(
                 logger.info(f"[FP8 DEBUG] First AITER FP8 linear call:")
                 logger.info(f"  input_2d: {input_2d.shape}, {input_2d.dtype}")
                 logger.info(f"  weight: {weight.shape}, {weight.dtype}")
-                logger.info(f"  qinput: {qinput.shape}, {qinput.dtype}, range=[{qinput.min():.2f}, {qinput.max():.2f}]")
+                logger.info(f"  qinput: {qinput.shape}, {qinput.dtype}")
                 logger.info(f"  x_scale: {x_scale_aiter.shape}, {x_scale_aiter.dtype}, range=[{x_scale_aiter.min():.6f}, {x_scale_aiter.max():.6f}]")
                 logger.info(f"  w_scale: {w_scale_aiter.shape}, {w_scale_aiter.dtype}, range=[{w_scale_aiter.min():.6f}, {w_scale_aiter.max():.6f}]")
+                # Sample a few values
+                logger.info(f"  qinput[0,:5]: {qinput[0,:5].float().tolist()}")
+                logger.info(f"  x_scale[0]: {x_scale_aiter[0].item():.6f}")
+                logger.info(f"  w_scale[0]: {w_scale_aiter[0].item():.6f}")
             
             # AITER gemm_a8w8_bpreshuffle expects: XQ: [M, K], WQ: [N, K] (shuffled)
             # Weight should already be shuffled during loading (see fp8.py line 382)
