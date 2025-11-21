@@ -1165,8 +1165,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             torch.cuda.empty_cache()
 
             # ROCm (_use_aiter): using column-wise scaling
-            layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
-            layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
+            # FP8 FIX: Don't multiply again if we already have per-channel scales from quantization
+            # Check if scales are already per-channel (not all the same value)
+            is_w13_perchannel = (layer.w13_weight_scale1[0].std() > 1e-6 if layer.num_local_experts > 0 else False)
+            is_w2_perchannel = (layer.w2_weight_scale1[0].std() > 1e-6 if layer.num_local_experts > 0 else False)
+            
+            if not is_w13_perchannel:
+                # Broadcast per-expert scale to per-channel
+                layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
+            if not is_w2_perchannel:
+                # Broadcast per-expert scale to per-channel
+                layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
         elif get_bool_env_var("SGLANG_MOE_PADDING"):
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
