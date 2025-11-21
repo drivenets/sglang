@@ -593,9 +593,9 @@ def apply_fp8_linear(
                 use_per_token_if_dynamic=True,  # Force per-token for AITER
             )
             
-            # Reshape scales for AITER (expects [M,1] and [1,N])
+            # Reshape scales for AITER (expects [M,1] and [N,1])
             x_scale_aiter = x_scale.view(-1, 1)
-            w_scale_aiter = weight_scale.view(1, -1)
+            w_scale_aiter = weight_scale.view(-1, 1)  # [N, 1] not [1, N]!
             
             # AITER gemm_a8w8_bpreshuffle expects: XQ: [M, K], WQ: [N, K] (shuffled)
             # Weight should already be shuffled during loading (see fp8.py line 382)
