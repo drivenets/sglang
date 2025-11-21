@@ -64,6 +64,9 @@ def quantize_weight_2d_blocks_fp8(
     qweight = torch.empty_like(weight, dtype=fp8_dtype)
     scales = torch.zeros((scale_n, scale_k), dtype=torch.float32, device=weight.device)
     
+    # Track scale statistics for debugging
+    scale_values = []
+    
     # Quantize each block
     for i in range(scale_n):
         for j in range(scale_k):
@@ -77,12 +80,27 @@ def quantize_weight_2d_blocks_fp8(
             
             # Compute scale for this block
             amax = block.abs().max().float().clamp(min=1e-12)
-            scale = fp8_max / amax
-            scales[i, j] = 1.0 / scale  # Store reciprocal for dequant
             
-            # Quantize block
-            block_q = (block.float() * scale).clamp(min=fp8_min, max=fp8_max)
+            # Try direct scale instead of reciprocal
+            # The Triton kernel multiplies by scale to dequantize
+            # So if q = x / amax * fp8_max, then x = q * amax / fp8_max
+            scale_factor = amax / fp8_max  # This is what kernel should multiply by
+            scales[i, j] = scale_factor
+            
+            # Quantize: q = x * (fp8_max / amax)
+            block_q = (block.float() / amax * fp8_max).clamp(min=fp8_min, max=fp8_max)
             qweight[n_start:n_end, k_start:k_end] = block_q.to(fp8_dtype)
+            
+            scale_values.append(scale_factor.item())
+    
+    # Log statistics for first weight only
+    if len(scale_values) > 0:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[FP8 BLOCK QUANT DEBUG] weight shape: {weight.shape}, "
+                   f"scale shape: {scales.shape}, "
+                   f"scale range: [{min(scale_values):.6f}, {max(scale_values):.6f}], "
+                   f"scale mean: {sum(scale_values)/len(scale_values):.6f}")
     
     return qweight, scales
 
