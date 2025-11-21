@@ -901,6 +901,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             
             # FP8 FIX: Use per-channel quantization for AITER instead of per-expert
+            # AITER MoE kernel expects: output * weight_scale1 * weight_scale
+            # So we store: weight_scale = max_scale, weight_scale1 = per_channel / max_scale
             if _use_aiter:
                 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
                 
@@ -910,20 +912,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w13_weight[expert, :, :], w13_scale_pc = per_token_group_quant_fp8(
                         w13_expert, w13_expert.shape[-1]
                     )
-                    # Store per-channel scales in weight_scale1
-                    layer.w13_weight_scale1[expert, :] = w13_scale_pc.squeeze()
-                    # Store max scale for compatibility
-                    layer.w13_weight_scale[expert] = w13_scale_pc.max()
+                    w13_scale_pc_sq = w13_scale_pc.squeeze()
+                    # Find max scale and store it
+                    max_scale_w13 = w13_scale_pc_sq.max()
+                    layer.w13_weight_scale[expert] = max_scale_w13
+                    # Store relative per-channel scales (will be multiplied by max_scale later)
+                    layer.w13_weight_scale1[expert, :] = w13_scale_pc_sq / max_scale_w13
                     
                     # Per-channel quantization for w2
                     w2_expert = layer.w2_weight.data[expert, :, :]  # [hidden, inter_dim]
                     w2_weight[expert, :, :], w2_scale_pc = per_token_group_quant_fp8(
                         w2_expert, w2_expert.shape[-1]
                     )
-                    # Store per-channel scales
-                    layer.w2_weight_scale1[expert, :] = w2_scale_pc.squeeze()
-                    # Store max scale for compatibility
-                    layer.w2_weight_scale[expert] = w2_scale_pc.max()
+                    w2_scale_pc_sq = w2_scale_pc.squeeze()
+                    # Find max scale and store it
+                    max_scale_w2 = w2_scale_pc_sq.max()
+                    layer.w2_weight_scale[expert] = max_scale_w2
+                    # Store relative per-channel scales
+                    layer.w2_weight_scale1[expert, :] = w2_scale_pc_sq / max_scale_w2
             else:
                 # Original per-expert quantization for non-AITER
                 for expert in range(layer.num_local_experts):
