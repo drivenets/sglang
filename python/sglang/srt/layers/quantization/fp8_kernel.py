@@ -318,7 +318,8 @@ def _per_token_group_quant_8bit_raw(
         if dtype == torch.int8:
             bit8_max = 127.0
         else:
-            bit8_max = 224.0
+            # AITER uses 2x fp8_max = 448.0 as quantization range
+            bit8_max = 448.0 if _use_aiter else 224.0
         bit8_min = -bit8_max  # TODO incorrect for int8
     else:
         if dtype == torch.int8:
