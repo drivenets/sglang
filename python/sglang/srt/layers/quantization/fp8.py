@@ -576,6 +576,15 @@ class Fp8LinearMethod(LinearMethodBase):
         weight_dim_to_check = layer.weight.shape[0] if _use_aiter else layer.weight.shape[1]
         use_compressed = _use_aiter and layer.weight_scale.numel() == weight_dim_to_check
         
+        # DEBUG: Log path selection
+        if not hasattr(self, '_logged_path'):
+            self._logged_path = True
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[FP8 PATH DEBUG] weight shape: {layer.weight.shape}, scale shape: {layer.weight_scale.shape}")
+            logger.info(f"[FP8 PATH DEBUG] _use_aiter: {_use_aiter}, weight_dim_to_check: {weight_dim_to_check}")
+            logger.info(f"[FP8 PATH DEBUG] use_compressed: {use_compressed}")
+        
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
