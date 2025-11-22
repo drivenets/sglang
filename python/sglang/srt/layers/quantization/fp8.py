@@ -631,7 +631,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        if self.quant_config.is_checkpoint_fp8_serialized:
+        # MIXED PRECISION: If skipping MoE quantization, use BF16 dtype
+        # This avoids OOM when loading unquantized MoE weights
+        if get_bool_env_var("SGLANG_FP8_SKIP_MOE"):
+            logger.info(f"[FP8 MIXED] Creating MoE weights in {params_dtype} (not FP8)")
+            # Don't override params_dtype - keep it as BF16
+        elif self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
@@ -804,6 +809,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        # MIXED PRECISION: Skip FP8 quantization for MoE if env var is set
+        # This keeps MoE in BF16 while quantizing attention layers to FP8
+        if get_bool_env_var("SGLANG_FP8_SKIP_MOE"):
+            logger.info("[FP8 MIXED] Skipping MoE quantization - keeping BF16")
+            return
+        
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
             return
