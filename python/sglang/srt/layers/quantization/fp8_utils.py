@@ -606,8 +606,9 @@ def apply_fp8_linear(
             )
             
             # Reshape scales for AITER (expects [M,1] and [N,1])
-            x_scale_aiter = x_scale.view(-1, 1)
-            w_scale_aiter = weight_scale.view(-1, 1)  # [N, 1] not [1, N]!
+            # FP8 CRITICAL FIX: AITER kernel requires FLOAT32 scales!
+            x_scale_aiter = x_scale.view(-1, 1).to(torch.float32)
+            w_scale_aiter = weight_scale.view(-1, 1).to(torch.float32)  # [N, 1] not [1, N]!
             
             # DEBUG: Log first call details
             if not hasattr(apply_fp8_linear, '_logged_once'):
