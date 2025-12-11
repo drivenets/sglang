@@ -44,7 +44,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter import gemm_a8w8_bpreshuffle, gemm_a8w8_blockscale_bpreshuffle, get_hip_quant
     # Use Triton blockscale directly (CK version didn't build)
     from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 
@@ -596,19 +596,36 @@ def apply_fp8_linear(
             logger.info(f"  weight_scale.numel(): {weight_scale.numel()}")
             logger.info(f"  Condition result: {_use_aiter and weight_scale.numel() == weight_out_dim}")
         
-        if _use_aiter and weight_scale.numel() == weight_out_dim:
-            # Use AITER's optimized per-channel FP8 GEMM
-            # AITER per-channel requires per-token activation quantization
+        # Check if we have per-channel (1D), per-token-group (2D), or per-tensor (scalar) scales
+        has_per_channel_scale = weight_scale.numel() == weight_out_dim
+        has_group_scale = (weight_scale.ndim == 2 and 
+                          weight_scale.shape[0] == weight_out_dim)
+        has_per_tensor_scale = weight_scale.numel() == 1
+        
+        if _use_aiter and (has_per_channel_scale or has_group_scale or has_per_tensor_scale):
+            # Use AITER's optimized FP8 GEMM (supports per-channel and per-token-group)
+            # AITER requires per-token activation quantization (always dynamic)
             qinput, x_scale = scaled_fp8_quant(
                 input_2d,
-                input_scale,
-                use_per_token_if_dynamic=True,  # Force per-token for AITER
+                None,  # Force dynamic per-token quantization for AITER
+                use_per_token_if_dynamic=True,
             )
             
-            # Reshape scales for AITER (expects [M,1] and [N,1])
+            # Reshape activation scale for AITER (expects [M,1])
             # FP8 CRITICAL FIX: AITER kernel requires FLOAT32 scales!
             x_scale_aiter = x_scale.view(-1, 1).to(torch.float32)
-            w_scale_aiter = weight_scale.view(-1, 1).to(torch.float32)  # [N, 1] not [1, N]!
+            
+            # Reshape weight scale based on quantization type
+            if has_per_tensor_scale:
+                # Per-tensor: scalar -> broadcast to [N, 1]
+                # Must clone to make contiguous for AITER kernel
+                w_scale_aiter = weight_scale.view(1).expand(weight_out_dim, 1).contiguous().to(torch.float32)
+            elif has_per_channel_scale:
+                # Per-channel: [N] -> [N, 1]
+                w_scale_aiter = weight_scale.view(-1, 1).to(torch.float32)
+            else:
+                # Per-token-group: already [N, num_groups], just convert dtype
+                w_scale_aiter = weight_scale.to(torch.float32)
             
             # DEBUG: Log first call details
             if not hasattr(apply_fp8_linear, '_logged_once'):
@@ -624,13 +641,33 @@ def apply_fp8_linear(
                 # Sample a few values
                 logger.info(f"  qinput[0,:5]: {qinput[0,:5].float().tolist()}")
                 logger.info(f"  x_scale[0]: {x_scale_aiter[0].item():.6f}")
-                logger.info(f"  w_scale[0]: {w_scale_aiter[0].item():.6f}")
+                if has_group_scale:
+                    logger.info(f"  w_scale[0,0:5]: {w_scale_aiter[0,:5].float().tolist()}")
+                else:
+                    logger.info(f"  w_scale[0]: {w_scale_aiter[0].item():.6f}")
             
-            # AITER gemm_a8w8_bpreshuffle expects: XQ: [M, K], WQ: [N, K] (shuffled)
-            # Weight should already be shuffled during loading (see fp8.py line 382)
-            output = gemm_a8w8_bpreshuffle(
-                qinput, weight, x_scale_aiter, w_scale_aiter, bias=None, dtype=input.dtype
-            )
+            # Choose kernel based on scale dimensionality
+            # Weight should already be shuffled during loading (see fp8.py)
+            if has_group_scale:
+                # Per-token-group: FALLBACK to dequantize + BF16 GEMM
+                # TODO: Implement optimized kernel for per-token-group quantization
+                # Dequantize activations: qinput [M, K] * x_scale [M, 1] -> [M, K]
+                input_dq = qinput.to(torch.float32) * x_scale_aiter
+                # Dequantize weights per-group: weight [N, K] with scale [N, num_groups]
+                # Vectorized version: repeat scales to match weight shape
+                group_size = weight.shape[1] // w_scale_aiter.shape[1]
+                # Repeat each scale group_size times along K dimension
+                # [N, num_groups] -> [N, K] by repeating each group
+                w_scale_expanded = w_scale_aiter.repeat_interleave(group_size, dim=1)
+                weight_dq = weight.to(torch.float32) * w_scale_expanded
+                # BF16 GEMM: input_dq @ weight_dq.T
+                output = torch.matmul(input_dq.to(input.dtype), weight_dq.t().to(input.dtype))
+            else:
+                # Per-channel or per-tensor: Use bpreshuffle kernel for 1D scales
+                # Expects: XQ: [M, K], WQ: [N, K] (shuffled), x_scale: [M, 1], w_scale: [N, 1]
+                output = gemm_a8w8_bpreshuffle(
+                    qinput, weight, x_scale_aiter, w_scale_aiter, bias=None, dtype=input.dtype
+                )
             
             if bias is not None:
                 output = output + bias

@@ -131,6 +131,9 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# Initialize variable at module level to avoid NameError
+enable_sgl_per_token_group_quant_8bit = False
+
 if _is_cuda:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
 
@@ -167,6 +170,8 @@ logger = logging.getLogger(__name__)
 def is_fp8_fnuz() -> bool:
     if _is_hip:
         # only device 0 is checked, this assumes MI300 platforms are homogeneous
+        # NOTE: MI355X (gfx950) technically uses fnuz, but AITER doesn't support it
+        # So we use fn for compatibility, with fp8_max=224.0 for MI3xx/MI3xx devices
         return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
     return False
 
@@ -610,9 +615,15 @@ def sglang_per_token_group_quant_fp8(
             )
         else:
             assert not enable_v2
-            sgl_per_token_group_quant_fp8(
-                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-            )
+            # For HIP, use Triton implementation
+            if _is_hip:
+                x_q, x_s = _per_token_group_quant_8bit_raw(
+                    x, group_size, eps, fp8_dtype, column_major_scales, scale_tma_aligned, scale_ue8m0
+                )
+            else:
+                sgl_per_token_group_quant_fp8(
+                    x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+                )
 
     return x_q, x_s
 

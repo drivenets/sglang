@@ -1007,6 +1007,12 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
                 f"into parameter ({param.size()})"
             )
 
+            # Convert uint8 -> float8 for FP8 checkpoints
+            # (safetensors doesn't support float8 directly)
+            # Use float8_e4m3fn for AITER compatibility (even on MI355X)
+            if param.dtype in [torch.float8_e4m3fn, torch.float8_e4m3fnuz] and loaded_weight.dtype == torch.uint8:
+                loaded_weight = loaded_weight.view(torch.float8_e4m3fn)
+            
             param.data.copy_(loaded_weight)
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to

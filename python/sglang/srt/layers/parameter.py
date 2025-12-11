@@ -55,6 +55,12 @@ class BasevLLMParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
+        if self.data.shape != loaded_weight.shape:
+            print(f"\n[FP8 DEBUG] Shape mismatch!", flush=True)
+            print(f"  Parameter shape: {self.data.shape}", flush=True)
+            print(f"  Loaded weight shape: {loaded_weight.shape}", flush=True)
+            print(f"  Parameter dtype: {self.data.dtype}", flush=True)
+            print(f"  Loaded weight dtype: {loaded_weight.dtype}\n", flush=True)
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 

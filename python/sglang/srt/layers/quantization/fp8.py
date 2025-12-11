@@ -113,6 +113,8 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        weight_scale_format: Optional[str] = None,
+        group_size: int = 128,
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -135,6 +137,9 @@ class Fp8Config(QuantizationConfig):
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
                 )
         self.weight_block_size = weight_block_size
+        # Per-token-group quantization support
+        self.weight_scale_format = weight_scale_format  # 'group', 'channel', or None (per-tensor)
+        self.group_size = group_size  # Group size for per-token-group quantization
 
     @classmethod
     def get_name(cls) -> str:
@@ -164,11 +169,15 @@ class Fp8Config(QuantizationConfig):
             # hacking ministral
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+        weight_scale_format = cls.get_from_keys_or(config, ["weight_scale_format"], None)
+        group_size = cls.get_from_keys_or(config, ["group_size"], 128)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            weight_scale_format=weight_scale_format,
+            group_size=group_size,
         )
 
     def get_quant_method(
@@ -317,12 +326,29 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale", scale)
+                # Check if using GROUP quantization (per-token-group)
+                weight_scale_format = getattr(self.quant_config, 'weight_scale_format', None)
+                group_size = getattr(self.quant_config, 'group_size', 128)
+                
+                if weight_scale_format == 'group':
+                    # Per-token-group quantization: scales are 2D [N, num_groups]
+                    num_groups = (input_size_per_partition + group_size - 1) // group_size
+                    scale = ModelWeightParameter(
+                        data=torch.empty(output_size_per_partition, num_groups, dtype=torch.float32),
+                        input_dim=1,
+                        output_dim=0,
+                        weight_loader=weight_loader,
+                    )
+                    scale[:] = torch.finfo(torch.float32).min
+                    layer.register_parameter("weight_scale", scale)
+                else:
+                    # Per-tensor quantization: scalar scale
+                    scale = PerTensorScaleParameter(
+                        data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                        weight_loader=weight_loader,
+                    )
+                    scale[:] = torch.finfo(torch.float32).min
+                    layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
             if (
@@ -343,6 +369,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        # GROUP quantization: Do minimal required operations only
+        weight_scale_format = getattr(self.quant_config, 'weight_scale_format', None)
+        if weight_scale_format == 'group':
+            # Essential operations for GROUP quantization
+            # Weights are already in correct [N, K] format from checkpoint, no transpose needed
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            # Wrap scale in Parameter
+            layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
+            # No input scale for dynamic activation
+            layer.input_scale = None
+            return
+        
         if self.block_quant:
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
@@ -480,14 +518,26 @@ class Fp8LinearMethod(LinearMethodBase):
                                 input_scale, requires_grad=False
                             )
 
-                    weight_scale, weight = requantize_with_max_scale(
-                        weight=weight,
-                        weight_scale=weight_scale,
-                        logical_widths=layer.logical_widths,
-                    )
+                    # Skip requantization for GROUP quantization (per-token-group)
+                    # GROUP scales are already correct and don't need requantization
+                    # For serialized FP8 checkpoints: skip requantization ONLY if single scale
+                    # (Multi-scale fused projections like QKV still need scale unification)
+                    weight_scale_format = getattr(self.quant_config, 'weight_scale_format', None)
+                    is_serialized = getattr(self.quant_config, 'is_checkpoint_fp8_serialized', False)
+                    needs_requant = weight_scale_format != 'group' and not (is_serialized and weight_scale.numel() == 1)
+                    if needs_requant:
+                        weight_scale, weight = requantize_with_max_scale(
+                            weight=weight,
+                            weight_scale=weight_scale,
+                            logical_widths=layer.logical_widths,
+                        )
 
                 # Update layer with new values.
-                layer.weight = Parameter(weight.t(), requires_grad=False)
+                # For AITER: weights are already in [N, K] format, no transpose needed
+                if _use_aiter:
+                    layer.weight = Parameter(weight, requires_grad=False)
+                else:
+                    layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 if (
                     hasattr(self.quant_config, "activation_scheme")
@@ -571,10 +621,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        # Enable compressed_tensor_quant for AITER per-channel path
+        # Enable compressed_tensor_quant for AITER per-channel, per-token-group, or per-tensor path
         # Note: AITER weights are pre-shuffled to [N, K], so check shape[0]
         weight_dim_to_check = layer.weight.shape[0] if _use_aiter else layer.weight.shape[1]
-        use_compressed = _use_aiter and layer.weight_scale.numel() == weight_dim_to_check
+        # For GROUP quantization: weight_scale is [N, num_groups], so check shape[0]
+        # For per-channel quantization: weight_scale is [N], so check numel()
+        # For per-tensor quantization: weight_scale is scalar (numel() == 1)
+        has_per_channel_scale = layer.weight_scale.numel() == weight_dim_to_check
+        has_group_scale = (layer.weight_scale.ndim == 2 and 
+                          layer.weight_scale.shape[0] == weight_dim_to_check)
+        has_per_tensor_scale = layer.weight_scale.numel() == 1
+        use_compressed = _use_aiter and (has_per_channel_scale or has_group_scale or has_per_tensor_scale)
         
         # DEBUG: Log path selection
         if not hasattr(self, '_logged_path'):
@@ -737,17 +794,49 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-            )
+            # For GROUP quantization, these will be 2D tensors
+            weight_scale_format = getattr(self.quant_config, 'weight_scale_format', None)
+            group_size = getattr(self.quant_config, 'group_size', 128)
+            
+            if weight_scale_format == 'group':
+                # Per-token-group quantization: scales are 2D
+                # Shape: [num_experts, output_dim, num_groups_K]
+                # where num_groups_K = input_dim // group_size
+                num_groups_K_w13 = (hidden_size + group_size - 1) // group_size
+                num_groups_K_w2 = (intermediate_size_per_partition + group_size - 1) // group_size
+                
+                w13_weight_scale = torch.nn.Parameter(
+                    torch.ones(
+                        num_experts, 
+                        2 * intermediate_size_per_partition, 
+                        num_groups_K_w13,
+                        dtype=torch.float32
+                    ), 
+                    requires_grad=False
+                )
+                w2_weight_scale = torch.nn.Parameter(
+                    torch.ones(
+                        num_experts, 
+                        hidden_size, 
+                        num_groups_K_w2,
+                        dtype=torch.float32
+                    ), 
+                    requires_grad=False
+                )
+            else:
+                w13_weight_scale = torch.nn.Parameter(
+                    torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                )
+                w2_weight_scale = torch.nn.Parameter(
+                    torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                )
+            
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-            if _is_hip:  # _use_aiter: TODO: add check back after triton kernel
+            if _is_hip and weight_scale_format != 'group':  # _use_aiter: TODO: add check back after triton kernel
                 # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
+                # Skip this for GROUP quantization as we already have the right scales above
                 w13_weight_scale1 = torch.nn.Parameter(
                     torch.ones(
                         num_experts,
@@ -763,13 +852,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
                 layer.register_parameter("w2_weight_scale1", w2_weight_scale1)
 
-        # Add the quantization method used (per tensor/grouped/channel)
+        # Add the quantization method used (per tensor/grouped/channel/block)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-            if self.block_quant
-            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+        # Check if we have per-token-group (GROUP) quantization from config
+        weight_scale_format = getattr(self.quant_config, 'weight_scale_format', None)
+        if self.block_quant:
+            quant_method = FusedMoeWeightScaleSupported.BLOCK.value
+        elif weight_scale_format == 'group':
+            quant_method = FusedMoeWeightScaleSupported.GROUP.value
+        else:
+            quant_method = FusedMoeWeightScaleSupported.TENSOR.value
+        
+        extra_weight_attrs.update({"quant_method": quant_method})
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
@@ -809,6 +903,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        # GROUP quantization: Do minimal required operations only
+        weight_scale_format = getattr(self.quant_config, 'weight_scale_format', None)
+        if weight_scale_format == 'group':
+            # Essential operations for GROUP quantization in MoE
+            # 1. Wrap weights and scales in Parameters
+            layer.w13_weight = torch.nn.Parameter(layer.w13_weight.data, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(layer.w2_weight.data, requires_grad=False)
+            layer.w13_weight_scale = torch.nn.Parameter(layer.w13_weight_scale.data, requires_grad=False)
+            layer.w2_weight_scale = torch.nn.Parameter(layer.w2_weight_scale.data, requires_grad=False)
+            # 2. No input scale for dynamic activation
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+            # 3. For HIP/AITER: shuffle weights for optimized kernel
+            if _use_aiter and shuffle_weight is not None:
+                layer.w13_weight.data = shuffle_weight(layer.w13_weight.contiguous(), (16, 16))
+                layer.w2_weight.data = shuffle_weight(layer.w2_weight.contiguous(), (16, 16))
+            return
+        
         # MIXED PRECISION: Skip FP8 quantization for MoE if env var is set
         # This keeps MoE in BF16 while quantizing attention layers to FP8
         if get_bool_env_var("SGLANG_FP8_SKIP_MOE"):
@@ -1547,6 +1659,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         else ActivationType.Gelu
                     ),
                     expert_mask=layer.expert_mask_gpu,
+                )
+            elif getattr(self.quant_config, 'weight_scale_format', None) == 'group':
+                # Per-token-group quantization (GROUP)
+                return fused_moe(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    quant_type=QuantType.per_1x128,  # Per-token-group with group_size=128
+                    w1_scale=layer.w13_weight_scale,  # 3D: [num_experts, 2*intermediate_size, num_groups]
+                    w2_scale=layer.w2_weight_scale,   # 3D: [num_experts, hidden_size, num_groups]
+                    activation=(
+                        ActivationType.Silu
+                        if activation == "silu"
+                        else ActivationType.Gelu
+                    ),
                 )
             else:
                 return fused_moe(
