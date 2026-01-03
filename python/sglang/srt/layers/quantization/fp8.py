@@ -98,6 +98,22 @@ if _use_aiter or _use_hip_int4:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+# Debug logging for AITER MoE kernel verification
+_aiter_moe_call_count = 0
+_aiter_moe_shapes_seen = set()
+
+def _log_aiter_moe_call(x, w1, topk_ids, quant_type):
+    global _aiter_moe_call_count, _aiter_moe_shapes_seen
+    _aiter_moe_call_count += 1
+    M = x.shape[0]
+    K = x.shape[-1]
+    E, N, _ = w1.shape
+    topk = topk_ids.shape[1]
+    shape_key = (M, E, N, K, topk, quant_type)
+    if shape_key not in _aiter_moe_shapes_seen:
+        _aiter_moe_shapes_seen.add(shape_key)
+        print(f"[AITER MoE] NEW SHAPE: M={M}, E={E}, N={N}, K={K}, topk={topk}, quant={quant_type} (call #{_aiter_moe_call_count})")
+
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -581,14 +597,27 @@ class Fp8LinearMethod(LinearMethodBase):
         
         if use_blockscale:
             # Use blockscale path with 2D scales
-            return self.w8a8_block_fp8_linear(
-                input=x,
-                weight=layer.weight,
-                block_size=self.quant_config.weight_block_size,
-                weight_scale=layer.weight_scale,  # 2D scales, no _inv suffix
-                input_scale=None,
-                bias=bias,
-            )
+            # Handle both bfloat16 input (needs quantization) and FP8 tuple input (pre-quantized)
+            if isinstance(x, tuple):
+                # x is (fp8_data, scale) - already quantized
+                return self.w8a8_block_fp8_linear(
+                    input=x[0],
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale,  # 2D scales, no _inv suffix
+                    input_scale=x[1],
+                    bias=bias,
+                )
+            else:
+                # x is bfloat16/float16 - needs quantization
+                return self.w8a8_block_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale,  # 2D scales, no _inv suffix
+                    input_scale=None,
+                    bias=bias,
+                )
         
         if self.block_quant:
             if use_intel_amx_backend(layer):
@@ -1643,6 +1672,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
+            # Debug logging for kernel verification
+            import os
+            if os.environ.get("AITER_DEBUG_KERNELS", "0") == "1":
+                _log_aiter_moe_call(x, layer.w13_weight, topk_ids, "block_quant" if self.block_quant else "per_token")
             if self.block_quant:
                 return fused_moe(
                     x,

@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_hip,
@@ -45,8 +46,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     import aiter
     from aiter import gemm_a8w8_bpreshuffle, gemm_a8w8_blockscale_bpreshuffle, get_hip_quant
-    # Use Triton blockscale directly (CK version didn't build)
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+    # Use CK blockscale (fixed build for ROCm 7.1.1)
+    from aiter import gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -257,6 +258,9 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
+_aiter_gemm_call_count = 0
+_aiter_gemm_shapes_seen = set()
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -265,35 +269,78 @@ def aiter_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-    input_2d = input.view(-1, input.shape[-1])
+    global _aiter_gemm_call_count, _aiter_gemm_shapes_seen
+    # Ensure input is contiguous for AITER kernels
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
-    
-    # OPTIMIZATION: Pad M to power-of-2 for tuned kernels (eliminates UNTUNED calls)
     M_orig, K = input_2d.shape
-    M_is_pow2 = (M_orig & (M_orig - 1)) == 0 and M_orig > 0
+    N = weight.shape[0]
     
-    if not M_is_pow2 and M_orig > 0:
-        # Pad to next power of 2
-        M_padded = 1 << (M_orig - 1).bit_length()
-        pad_size = M_padded - M_orig
-        input_2d_padded = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_size), value=0.0)
-    else:
-        input_2d_padded = input_2d
+    # Debug logging for kernel verification
+    _aiter_gemm_call_count += 1
+    shape_key = (M_orig, N, K)
+    if shape_key not in _aiter_gemm_shapes_seen:
+        _aiter_gemm_shapes_seen.add(shape_key)
+        import os
+        if os.environ.get("AITER_DEBUG_KERNELS", "0") == "1":
+            print(f"[AITER GEMM] NEW SHAPE: M={M_orig}, N={N}, K={K} (call #{_aiter_gemm_call_count})")
+    
+    # Check if input is already FP8 (pre-quantized)
+    is_fp8_input = input.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, 
+                                    torch.float8_e5m2, torch.float8_e5m2fnuz)
+    
+    if is_fp8_input and input_scale is not None:
+        # Input is already quantized - use it directly with provided scale
+        q_input = input_2d
+        x_scale = input_scale
         pad_size = 0
+        output_dtype = torch.bfloat16  # FP8 input should produce bfloat16 output
+    elif is_fp8_input:
+        # FP8 input without scale - convert to bfloat16 first, then requantize
+        # This can happen when previous layer outputs FP8 without scale tracking
+        input_2d = input_2d.to(torch.bfloat16)
+        output_dtype = torch.bfloat16
+        
+        # Pad M to power-of-2 for tuned kernels
+        M_is_pow2 = (M_orig & (M_orig - 1)) == 0 and M_orig > 0
+        if not M_is_pow2 and M_orig > 0:
+            M_padded = 1 << (M_orig - 1).bit_length()
+            pad_size = M_padded - M_orig
+            input_2d_padded = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_size), value=0.0)
+        else:
+            input_2d_padded = input_2d
+            pad_size = 0
+        
+        input_2d_padded = input_2d_padded.contiguous()
+        q_input, x_scale = aiter_per1x128_quant(input_2d_padded, quant_dtype=aiter.dtypes.fp8)
+    else:
+        # Dynamic quantization: input should be bfloat16/float16
+        output_dtype = input.dtype
+        
+        # Pad M to power-of-2 for tuned kernels
+        M_is_pow2 = (M_orig & (M_orig - 1)) == 0 and M_orig > 0
+        if not M_is_pow2 and M_orig > 0:
+            M_padded = 1 << (M_orig - 1).bit_length()
+            pad_size = M_padded - M_orig
+            input_2d_padded = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_size), value=0.0)
+        else:
+            input_2d_padded = input_2d
+            pad_size = 0
 
-    q_input, x_scale = aiter_per1x128_quant(input_2d_padded, quant_dtype=aiter.dtypes.fp8)
+        input_2d_padded = input_2d_padded.contiguous()
+        q_input, x_scale = aiter_per1x128_quant(input_2d_padded, quant_dtype=aiter.dtypes.fp8)
+    
     output_padded = gemm_a8w8_blockscale(
-        q_input, weight, x_scale, weight_scale, dtype=input.dtype
+        q_input, weight, x_scale, weight_scale, dtype=output_dtype
     )
     
-    # Slice back to original M
+    # Slice back to original M if we padded
     output = output_padded[:M_orig, :] if pad_size > 0 else output_padded
 
     if bias is not None:
         output += bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(
@@ -939,6 +986,19 @@ def apply_fp8_linear(
             )
 
 
+# Alias for apply_fp8_linear for PTPC (Per-Token-Per-Channel) quantization strategy
+# The underlying implementation is the same as apply_fp8_linear
+apply_fp8_ptpc_linear = apply_fp8_linear
+
+
+def validate_fp8_block_shape(block_shape: List[int]) -> None:
+    """Validate FP8 block shape for block-wise quantization."""
+    if len(block_shape) != 2:
+        raise ValueError(f"block_shape must have 2 elements, got {len(block_shape)}")
+    if block_shape[0] <= 0 or block_shape[1] <= 0:
+        raise ValueError(f"block_shape elements must be positive, got {block_shape}")
+
+
 def can_auto_enable_marlin_fp8() -> bool:
     try:
         major, minor = get_device_capability()
@@ -946,3 +1006,54 @@ def can_auto_enable_marlin_fp8() -> bool:
         return 80 <= sm < 89
     except Exception:
         return False
+
+
+def initialize_fp8_gemm_config(server_args=None) -> None:
+    """Initialize FP8 GEMM configuration.
+    
+    This function sets up the FP8 GEMM backend configuration.
+    Currently a stub - actual implementation can configure:
+    - FP8 blockwise GEMM backend selection
+    - Cutlass vs DeepGEMM vs Triton backend
+    - Block size configuration
+    """
+    # For AITER on AMD, the configuration is already handled by aiter
+    # No additional setup needed currently
+    pass
+
+
+# Blackwell/SM100 specific functions - stubs for AMD compatibility
+def inverse_transform_scale_ue8m0(scale: torch.Tensor, mn: int = 1) -> torch.Tensor:
+    """Inverse transform UE8M0 scale format (Blackwell-specific).
+    
+    On AMD, this is a no-op as UE8M0 format is not used.
+    """
+    return scale
+
+
+def transform_scale_ue8m0_inplace(scale: torch.Tensor) -> torch.Tensor:
+    """Transform scale to UE8M0 format in-place (Blackwell-specific).
+    
+    On AMD, this is a no-op as UE8M0 format is not used.
+    """
+    return scale
+
+
+def quant_weight_ue8m0(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: Tuple[int, int] = (1, 128),
+) -> torch.Tensor:
+    """Quantize weight using UE8M0 format (Blackwell-specific).
+    
+    On AMD, returns the weight unchanged.
+    """
+    return weight
+
+
+def should_deepgemm_weight_requant_ue8m0(weight_block_size: Optional[List[int]] = None) -> bool:
+    """Check if DeepGEMM weight requantization to UE8M0 is needed.
+    
+    Always returns False on AMD as UE8M0 is NVIDIA Blackwell specific.
+    """
+    return False

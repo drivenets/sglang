@@ -109,6 +109,11 @@ show_time_cost = False
 time_infos = {}
 
 
+def align(val: int, alignment: int = 128) -> int:
+    """Align a value to the specified alignment (default 128)."""
+    return int((val + alignment - 1) // alignment * alignment)
+
+
 def get_or_create_event_loop():
     """Gets the running event loop or creates a new one if it doesn't exist."""
     try:

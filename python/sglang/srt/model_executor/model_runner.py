@@ -2673,6 +2673,9 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
+        import time as _time
+        _fwd_t0 = _time.perf_counter()
+        
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -2685,11 +2688,24 @@ class ModelRunner:
         )
 
         if can_run_graph:
+            _fwd_t1 = _time.perf_counter()
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            _fwd_t2 = _time.perf_counter()
+            
+            # Log timing for decode steps
+            if forward_batch.forward_mode.is_decode():
+                self._fwd_timing_count = getattr(self, '_fwd_timing_count', 0) + 1
+                if self._fwd_timing_count % 10 == 0:
+                    logger.info(
+                        f"[MODEL_FORWARD] CUDA graph decode: "
+                        f"can_run_check={(_fwd_t1 - _fwd_t0)*1000:.2f}ms, "
+                        f"graph_replay={(_fwd_t2 - _fwd_t1)*1000:.2f}ms"
+                    )
+            
             return ret, can_run_graph
 
         # For MLP sync

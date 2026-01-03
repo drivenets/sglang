@@ -223,6 +223,19 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
+    @property
+    def chunked_req(self):
+        """Backward compatibility: return first chunked request or None."""
+        return self.chunked_reqs[0] if self.chunked_reqs else None
+
+    @chunked_req.setter
+    def chunked_req(self, value):
+        """Backward compatibility: set single chunked request."""
+        if value is None:
+            self.chunked_reqs = []
+        else:
+            self.chunked_reqs = [value]
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -467,7 +480,11 @@ class Scheduler(
             self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
-        self.chunked_req = None
+        # Multi-request chunked prefill: use list instead of single request
+        # This enables round-robin scheduling across multiple long requests
+        self.chunked_reqs = []  # List of chunked requests
+        self.chunked_req_index = 0  # Round-robin index
+        # Keep chunked_req as property for backward compatibility
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -979,19 +996,47 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        # TIMING INSTRUMENTATION - track decode step timing
+        _timing_enabled = True
+        _timing_count = 0
+        _timing_interval = 10  # Print every N decode steps
+        
         while True:
+            _t_loop_start = time.perf_counter()
+            
             recv_reqs = self.recv_requests()
+            _t_recv = time.perf_counter()
+            
             self.process_input_requests(recv_reqs)
+            _t_process_input = time.perf_counter()
 
             if self._engine_paused:
                 continue
 
             batch = self.get_next_batch_to_run()
+            _t_get_batch = time.perf_counter()
             self.cur_batch = batch
 
             if batch:
+                _t_before_run = time.perf_counter()
                 result = self.run_batch(batch)
+                _t_after_run = time.perf_counter()
                 self.process_batch_result(batch, result)
+                _t_after_process = time.perf_counter()
+                
+                # Print timing for decode batches
+                if _timing_enabled and batch.forward_mode.is_decode():
+                    _timing_count += 1
+                    if _timing_count % _timing_interval == 0:
+                        logger.info(
+                            f"[TIMING] Decode step {_timing_count}: "
+                            f"recv={(_t_recv - _t_loop_start)*1000:.2f}ms, "
+                            f"process_input={(_t_process_input - _t_recv)*1000:.2f}ms, "
+                            f"get_batch={(_t_get_batch - _t_process_input)*1000:.2f}ms, "
+                            f"run_batch={(_t_after_run - _t_before_run)*1000:.2f}ms, "
+                            f"process_result={(_t_after_process - _t_after_run)*1000:.2f}ms, "
+                            f"TOTAL={(_t_after_process - _t_loop_start)*1000:.2f}ms"
+                        )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1648,23 +1693,24 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         if self.dllm_config is not None:
-            if self.chunked_req is not None and self.chunked_req.finished():
-                self.chunked_req = None
+            # Remove finished chunked requests
+            self.chunked_reqs = [r for r in self.chunked_reqs if not r.finished()]
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
-        if self.chunked_req:
+        # Multi-request chunked prefill: handle ALL chunked requests
+        for creq in self.chunked_reqs:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
-            chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            chunked_req_to_exclude.add(creq)
+            self.tree_cache.cache_unfinished_req(creq, chunked=True)
             # chunked request keeps its rid but will get a new req_pool_idx
             if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
-                    self.chunked_req.req_pool_idx, free_mamba_cache=False
+                    creq.req_pool_idx, free_mamba_cache=False
                 )
             else:
-                self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+                self.req_to_token_pool.free(creq.req_pool_idx)
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
@@ -1737,18 +1783,18 @@ class Scheduler(
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not self.chunked_reqs:  # Check if ANY chunked requests exist
             return None
 
         running_bs = len(self.running_batch.reqs)
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+        # Ignore the check if chunked_reqs is not empty.
+        # In the non-PP case, when chunked_reqs is not empty, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked request has just been released.
         # In PP case, a chunked req can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked request to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and not self.chunked_req
+            and not self.chunked_reqs  # Check list instead of single
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -1779,9 +1825,25 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # Multi-request chunked prefill: process ONE chunk from the next request in round-robin
+        # This ensures fair scheduling - each request gets its turn before others
+        if self.chunked_reqs:
+            # Get next chunked request (round-robin for fairness)
+            idx = self.chunked_req_index % len(self.chunked_reqs)
+            chunked_req = self.chunked_reqs[idx]
+            chunked_req.init_next_round_input()
+            
+            result = adder.add_chunked_req(chunked_req)
+            
+            if result is None:
+                # This request finished chunking, remove it
+                self.chunked_reqs.pop(idx)
+                # Adjust index if needed
+                if self.chunked_reqs and idx >= len(self.chunked_reqs):
+                    self.chunked_req_index = 0
+            else:
+                # Move to next request for next iteration (round-robin)
+                self.chunked_req_index = (idx + 1) % max(1, len(self.chunked_reqs))
 
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
@@ -1853,12 +1915,13 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        # Multi-request chunked prefill: add new chunked request to the list
         if adder.new_chunked_req is not None:
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+            self.chunked_reqs.append(adder.new_chunked_req)
 
-        if self.chunked_req:
-            self.chunked_req.is_chunked += 1
+        # Update is_chunked counter for all chunked requests
+        for creq in self.chunked_reqs:
+            creq.is_chunked += 1
 
         # Print stats
         if self.current_scheduler_metrics_enabled():
@@ -1969,6 +2032,7 @@ class Scheduler(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        _rb_t0 = time.perf_counter()
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -1987,6 +2051,8 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        _rb_t1 = time.perf_counter()
+        
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
@@ -1994,6 +2060,8 @@ class Scheduler(
             if self.enable_overlap or self.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
+            
+            _rb_t2 = time.perf_counter()
 
             if self.enable_overlap:
                 # FIXME: remove this assert
@@ -2047,11 +2115,28 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
+                _rb_t3 = time.perf_counter()
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
                 )
+                _rb_t4 = time.perf_counter()
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+                _rb_t5 = time.perf_counter()
+                
+                # Log detailed timing for decode steps
+                if batch.forward_mode.is_decode() and hasattr(self, '_rb_timing_count'):
+                    self._rb_timing_count = getattr(self, '_rb_timing_count', 0) + 1
+                    if self._rb_timing_count % 10 == 0:
+                        logger.info(
+                            f"[RUN_BATCH] Decode: "
+                            f"prep={(_rb_t1 - _rb_t0)*1000:.2f}ms, "
+                            f"get_worker_batch={(_rb_t2 - _rb_t1)*1000:.2f}ms, "
+                            f"forward={(_rb_t4 - _rb_t3)*1000:.2f}ms, "
+                            f"update_cache={(_rb_t5 - _rb_t4)*1000:.2f}ms"
+                        )
+                elif batch.forward_mode.is_decode():
+                    self._rb_timing_count = 1
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
@@ -2453,8 +2538,8 @@ class Scheduler(
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
             if recv_req.mode == "in_place":
-                if self.chunked_req is not None:
-                    chunked_req_to_exclude.add(self.chunked_req)
+                # Exclude ALL chunked requests
+                chunked_req_to_exclude.update(self.chunked_reqs)
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
@@ -2471,7 +2556,7 @@ class Scheduler(
                     self._add_request_to_queue(req)
 
             self.running_batch.batch_is_full = False
-            self.chunked_req = None
+            self.chunked_reqs = []  # Clear all chunked requests
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False

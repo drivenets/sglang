@@ -375,6 +375,8 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+        import time as _time
+        _fbg_t0 = _time.perf_counter()
 
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
@@ -385,6 +387,8 @@ class TpModelWorker(BaseTpWorker):
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
+        _fbg_t1 = _time.perf_counter()
+        
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
@@ -397,11 +401,14 @@ class TpModelWorker(BaseTpWorker):
             if self.is_dllm():
                 return self._forward_batch_generation_dllm(forward_batch)
 
+            _fbg_t2 = _time.perf_counter()
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            _fbg_t3 = _time.perf_counter()
+            
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -443,9 +450,24 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, model_worker_batch
                     )
             else:
+                _fbg_t4 = _time.perf_counter()
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                _fbg_t5 = _time.perf_counter()
+                
+                # Log timing for decode batches
+                if forward_batch.forward_mode.is_decode():
+                    self._fbg_timing_count = getattr(self, '_fbg_timing_count', 0) + 1
+                    if self._fbg_timing_count % 10 == 0:
+                        import logging
+                        logging.getLogger(__name__).info(
+                            f"[FWD_BATCH_GEN] Decode: "
+                            f"init_batch={(_fbg_t1 - _fbg_t0)*1000:.2f}ms, "
+                            f"model_forward={(_fbg_t3 - _fbg_t2)*1000:.2f}ms, "
+                            f"sample={(_fbg_t5 - _fbg_t4)*1000:.2f}ms, "
+                            f"TOTAL={(_fbg_t5 - _fbg_t0)*1000:.2f}ms"
+                        )
 
             return batch_result
         else:
