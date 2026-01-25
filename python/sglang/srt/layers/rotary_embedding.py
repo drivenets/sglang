@@ -34,7 +34,48 @@ else:
     FusedSetKVBufferArg = None
 
 if _use_aiter:
-    from aiter.rotary_embedding import get_rope as aiter_get_rope
+    from aiter.rotary_embedding import get_rope as _aiter_get_rope_orig
+    from aiter.rotary_embedding import RotaryEmbedding as AiterRotaryEmbedding
+
+    class AiterRotaryEmbeddingWrapper(AiterRotaryEmbedding):
+        """Wrapper around AITER's RotaryEmbedding that accepts fused_set_kv_buffer_arg."""
+
+        def forward(
+            self,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor = None,
+            offsets: torch.Tensor = None,
+            fused_set_kv_buffer_arg=None,  # Accept but ignore this argument
+            **kwargs,
+        ):
+            # AITER doesn't support fused_set_kv_buffer_arg, so we ignore it
+            return super().forward(positions, query, key, offsets, **kwargs)
+
+    def aiter_get_rope(
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style=True,
+        rope_scaling=None,
+        dtype=None,
+        partial_rotary_factor=1.0,  # Accept but ignore - AITER doesn't use this
+        **kwargs,
+    ):
+        """Wrapper around AITER's get_rope that returns our wrapper class."""
+        rope = _aiter_get_rope_orig(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            rope_scaling,
+            dtype,
+        )
+        # Replace the class with our wrapper
+        rope.__class__ = AiterRotaryEmbeddingWrapper
+        return rope
 
 if is_npu():
     import torch_npu
@@ -2085,6 +2126,10 @@ def get_rope_cpu(
     return rotary_emb
 
 
+# Save the original get_rope before wrapping
+_original_get_rope = get_rope
+
+
 def get_rope_wrapper(
     head_size: int,
     rotary_dim: int,
@@ -2097,7 +2142,7 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        wrapper = aiter_get_rope if _use_aiter else get_rope
+        wrapper = aiter_get_rope if _use_aiter else _original_get_rope
         return wrapper(
             head_size,
             rotary_dim,

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -313,8 +314,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, mxfp4_block
             )
+        elif _is_hip:
+            # HIP/ROCm also needs padding to match the weight loading calculation
+            # in gpt_oss.py which uses per_rank_intermediate_size = ceil(intermediate_size_block / moe_tp_size) * mxfp4_block
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
+            )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
+        self.intermediate_size_per_partition_original = intermediate_size_per_partition  # Before mxfp4_block padding
 
         self.hidden_size = hidden_size
         # Fused gate_up_proj (column parallel)
@@ -575,6 +583,216 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+        elif _is_hip:
+            # HIP/ROCm path: Check if CK-tile kernel should be used
+            use_cktile = os.environ.get("SGLANG_USE_CKTILE_MXFP4", "0") == "1"
+            
+            if not use_cktile:
+                # Default: Upcast MXFP4 weights to BF16 for Triton MOE kernel
+                from aiter.utility.fp4_utils import mxfp4_to_f32, e8m0_to_f32
+                
+                log_info_on_rank0(
+                    logger,
+                    f"Upcasting MXFP4 weights to BF16 for HIP/ROCm (layer: {self.prefix})",
+                )
+                
+                def upcast_mxfp4_to_bf16(weight, scale):
+                    """Upcast mxfp4 weights to bf16 using scale."""
+                    w_f32 = mxfp4_to_f32(weight)
+                    s_f32 = e8m0_to_f32(scale.view(torch.uint8))
+                    s_expanded = s_f32.repeat_interleave(32, dim=-1)
+                    s_expanded = s_expanded[..., :w_f32.shape[-1]]
+                    return (w_f32 * s_expanded).to(torch.bfloat16)
+                
+                w13_weight_bf16 = []
+                w2_weight_bf16 = []
+                for i in range(layer.w13_weight.shape[0]):
+                    w13_weight_bf16.append(
+                        upcast_mxfp4_to_bf16(layer.w13_weight[i], layer.w13_weight_scale[i])
+                    )
+                for i in range(layer.w2_weight.shape[0]):
+                    w2_weight_bf16.append(
+                        upcast_mxfp4_to_bf16(layer.w2_weight[i], layer.w2_weight_scale[i])
+                    )
+                
+                w13_weight = torch.stack(w13_weight_bf16)
+                w2_weight = torch.stack(w2_weight_bf16)
+                
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale
+                del layer.w2_weight_scale
+                layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+                layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+                return
+            
+            # CK-tile path: Use AITER's CK-tile MXFP4 MOE kernel with proper shuffling
+            from aiter.ops.shuffle import shuffle_weight_a16w4, shuffle_scale_a16w4
+            
+            log_info_on_rank0(
+                logger,
+                f"Shuffling MoE weights for AITER CK-tile MXFP4 kernel (layer: {self.prefix})",
+            )
+            log_info_on_rank0(
+                logger,
+                f"  w13_weight shape: {layer.w13_weight.shape}, w13_scale shape: {layer.w13_weight_scale.shape}",
+            )
+            log_info_on_rank0(
+                logger,
+                f"  w2_weight shape: {layer.w2_weight.shape}, w2_scale shape: {layer.w2_weight_scale.shape}",
+            )
+            
+            # Get current dimensions from the layer
+            num_local_experts = layer.w13_weight.shape[0]
+            current_inter_2x = layer.w13_weight.shape[1]  # 2 * intermediate_size_per_partition (already padded to mxfp4_block)
+            current_hidden_pk = layer.w13_weight.shape[2]  # hidden_size // 2
+            current_hidden = current_hidden_pk * 2
+            current_inter = current_inter_2x // 2  # This is the mxfp4_block-padded size (384)
+            
+            # Get the ORIGINAL intermediate size before mxfp4_block padding
+            # This is needed because the actual data only covers [0:original] and [current_inter:current_inter+original]
+            original_inter = self.intermediate_size_per_partition_original  # 360
+            
+            # Calculate padding needed for CK-tile kernel
+            # hidden_size needs to be divisible by 256 (for K_pk divisible by 128)
+            # intermediate_size needs to be divisible by 256 (for scale K1 divisible by 8)
+            hidden_pad = (256 - (current_hidden % 256)) % 256
+            inter_pad = (256 - (current_inter % 256)) % 256
+            
+            padded_hidden = current_hidden + hidden_pad
+            padded_inter = current_inter + inter_pad
+            
+            log_info_on_rank0(
+                logger,
+                f"  Padding: hidden {current_hidden} + {hidden_pad} = {padded_hidden}, inter {current_inter} + {inter_pad} = {padded_inter}, original_inter={original_inter}",
+            )
+            log_info_on_rank0(
+                logger,
+                f"  w13_weight stats: min={layer.w13_weight.min()}, max={layer.w13_weight.max()}, mean={layer.w13_weight.float().mean():.4f}",
+            )
+            log_info_on_rank0(
+                logger,
+                f"  w2_weight stats: min={layer.w2_weight.min()}, max={layer.w2_weight.max()}, mean={layer.w2_weight.float().mean():.4f}",
+            )
+            
+            # Store padding info for forward pass
+            layer.hidden_pad = hidden_pad
+            layer.intermediate_pad = inter_pad
+            layer.original_hidden_size = current_hidden
+            layer.original_intermediate_size = current_inter
+            
+            # Get weight tensors
+            w13_weight = layer.w13_weight.data  # [E, 2*inter, hidden//2]
+            w13_scale = layer.w13_weight_scale.data  # [E, 2*inter, hidden//32]
+            w2_weight = layer.w2_weight.data  # [E, hidden, inter//2]
+            w2_scale = layer.w2_weight_scale.data  # [E, hidden, inter//32]
+            w13_bias = layer.w13_weight_bias.data.to(torch.float32)
+            w2_bias = layer.w2_weight_bias.data.to(torch.float32)
+            
+            # Pad weights if needed
+            # The checkpoint layout is INTERLEAVED: [gate_0, up_0, gate_1, up_1, ...]
+            # CK-tile kernel expects SEQUENTIAL: [gate_0, gate_1, ..., up_0, up_1, ...]
+            # So we need to de-interleave and then pad
+            
+            if hidden_pad > 0 or inter_pad > 0:
+                # De-interleave and pad w13_weight: [E, 2*current_inter, hidden//2] -> [E, 2*padded_inter, padded_hidden//2]
+                # Input layout: [gate_0, up_0, gate_1, up_1, ..., gate_{current_inter-1}, up_{current_inter-1}]
+                # Output layout: [gate_0, gate_1, ..., gate_{padded_inter-1}, up_0, up_1, ..., up_{padded_inter-1}]
+                new_w13_weight = torch.zeros(
+                    (num_local_experts, 2 * padded_inter, padded_hidden // 2),
+                    dtype=w13_weight.dtype, device=w13_weight.device
+                )
+                # Extract gate weights (even rows) and copy to first half
+                gate_weights = w13_weight[:, 0::2, :]  # [E, current_inter, hidden//2]
+                new_w13_weight[:, :current_inter, :current_hidden_pk] = gate_weights
+                # Extract up weights (odd rows) and copy to second half
+                up_weights = w13_weight[:, 1::2, :]  # [E, current_inter, hidden//2]
+                new_w13_weight[:, padded_inter:padded_inter + current_inter, :current_hidden_pk] = up_weights
+                w13_weight = new_w13_weight
+                
+                # De-interleave and pad w13_scale
+                new_w13_scale = torch.zeros(
+                    (num_local_experts, 2 * padded_inter, padded_hidden // 32),
+                    dtype=w13_scale.dtype, device=w13_scale.device
+                )
+                gate_scale = w13_scale[:, 0::2, :]
+                new_w13_scale[:, :current_inter, :current_hidden // 32] = gate_scale
+                up_scale = w13_scale[:, 1::2, :]
+                new_w13_scale[:, padded_inter:padded_inter + current_inter, :current_hidden // 32] = up_scale
+                w13_scale = new_w13_scale
+                
+                # De-interleave and pad w13_bias
+                new_w13_bias = torch.zeros(
+                    (num_local_experts, 2 * padded_inter),
+                    dtype=w13_bias.dtype, device=w13_bias.device
+                )
+                gate_bias = w13_bias[:, 0::2]
+                new_w13_bias[:, :current_inter] = gate_bias
+                up_bias = w13_bias[:, 1::2]
+                new_w13_bias[:, padded_inter:padded_inter + current_inter] = up_bias
+                w13_bias = new_w13_bias
+                
+                # Pad w2_weight: [E, hidden, inter//2] -> [E, padded_hidden, padded_inter//2]
+                new_w2_weight = torch.zeros(
+                    (num_local_experts, padded_hidden, padded_inter // 2),
+                    dtype=w2_weight.dtype, device=w2_weight.device
+                )
+                new_w2_weight[:, :current_hidden, :current_inter // 2] = w2_weight
+                w2_weight = new_w2_weight
+                
+                # Pad w2_scale: [E, hidden, inter//32] -> [E, padded_hidden, padded_inter//32]
+                new_w2_scale = torch.zeros(
+                    (num_local_experts, padded_hidden, padded_inter // 32),
+                    dtype=w2_scale.dtype, device=w2_scale.device
+                )
+                new_w2_scale[:, :current_hidden, :current_inter // 32] = w2_scale
+                w2_scale = new_w2_scale
+                
+                # Pad w2_bias: [E, hidden] -> [E, padded_hidden]
+                new_w2_bias = torch.zeros(
+                    (num_local_experts, padded_hidden),
+                    dtype=w2_bias.dtype, device=w2_bias.device
+                )
+                new_w2_bias[:, :current_hidden] = w2_bias
+                w2_bias = new_w2_bias
+            
+            # Shuffle weights for CK-tile kernel (a16w4 path)
+            w13_weight_shuffled = shuffle_weight_a16w4(w13_weight, 16, True)  # gate_up=True
+            w2_weight_shuffled = shuffle_weight_a16w4(w2_weight, 16, False)  # gate_up=False
+            
+            # Shuffle scales - need to reshape to [E * N, K // 32] format
+            w13_scale_flat = w13_scale.reshape(
+                num_local_experts * 2 * padded_inter, padded_hidden // 32
+            )
+            w13_scale_shuffled = shuffle_scale_a16w4(w13_scale_flat, num_local_experts, True)
+            # Convert to float8_e8m0fnu (the scale is stored as uint8 in checkpoint but kernel expects e8m0)
+            w13_scale_shuffled = w13_scale_shuffled.view(torch.float8_e8m0fnu)
+            
+            w2_scale_flat = w2_scale.reshape(
+                num_local_experts * padded_hidden, padded_inter // 32
+            )
+            w2_scale_shuffled = shuffle_scale_a16w4(w2_scale_flat, num_local_experts, False)
+            w2_scale_shuffled = w2_scale_shuffled.view(torch.float8_e8m0fnu)
+            
+            # Update layer parameters
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            del layer.w13_weight_bias
+            del layer.w2_weight_bias
+            
+            layer.w13_weight = Parameter(w13_weight_shuffled, requires_grad=False)
+            layer.w13_weight_scale = Parameter(w13_scale_shuffled, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight_shuffled, requires_grad=False)
+            layer.w2_weight_scale = Parameter(w2_scale_shuffled, requires_grad=False)
+            layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
+            layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
+            
+            # Mark as using CK-tile kernel
+            layer.use_cktile_mxfp4 = True
+            layer.padded_hidden_size = padded_hidden
+            layer.padded_intermediate_size = padded_inter
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
@@ -689,6 +907,87 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
+
+        # Check if using CK-tile MXFP4 kernel (HIP/ROCm path with proper shuffling)
+        if _is_hip and getattr(layer, 'use_cktile_mxfp4', False):
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+            
+            topk_weights, topk_ids, _ = topk_output
+            topk_weights = topk_weights.to(torch.float32)  # aiter's moe_sorting requires FP32
+            
+            # Debug: log input stats (only first call)
+            if not hasattr(layer, '_debug_logged'):
+                layer._debug_logged = True
+                log_info_on_rank0(
+                    logger,
+                    f"CK-tile forward: x shape={x.shape}, topk_weights shape={topk_weights.shape}, topk_ids shape={topk_ids.shape}",
+                )
+                log_info_on_rank0(
+                    logger,
+                    f"  x stats: min={x.min():.4f}, max={x.max():.4f}, mean={x.mean():.4f}",
+                )
+                log_info_on_rank0(
+                    logger,
+                    f"  w13_weight shape={layer.w13_weight.shape}, w2_weight shape={layer.w2_weight.shape}",
+                )
+                log_info_on_rank0(
+                    logger,
+                    f"  hidden_pad={layer.hidden_pad}, intermediate_pad={layer.intermediate_pad}",
+                )
+            
+            # Pad input if needed (hidden dimension)
+            original_hidden = x.shape[-1]
+            if layer.hidden_pad > 0:
+                x = torch.nn.functional.pad(x, (0, layer.hidden_pad), mode='constant', value=0.0)
+            
+            # Convert weights to fp4x2 dtype if available
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+            else:
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+            
+            # Mark as shuffled for aiter
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
+            
+            output = fused_moe(
+                x,
+                w13_weight,
+                w2_weight,
+                topk_weights,
+                topk_ids,
+                quant_type=QuantType.per_1x32,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=ActivationType.Swiglu,
+                doweight_stage1=False,
+                intermediate_pad=layer.intermediate_pad,
+                hidden_pad=layer.hidden_pad,
+                bias1=layer.w13_weight_bias,
+                bias2=layer.w2_weight_bias,
+            )
+            
+            # Debug: log output stats (only first call)
+            if not hasattr(layer, '_debug_logged_output'):
+                layer._debug_logged_output = True
+                log_info_on_rank0(
+                    logger,
+                    f"  output shape={output.shape}, stats: min={output.min():.4f}, max={output.max():.4f}, mean={output.mean():.4f}",
+                )
+            
+            # Trim output to original hidden size (remove padding)
+            if layer.hidden_pad > 0:
+                output = output[:, :original_hidden]
+                if not hasattr(layer, '_debug_logged_trim'):
+                    layer._debug_logged_trim = True
+                    log_info_on_rank0(
+                        logger,
+                        f"  Trimmed output: {output.shape}, stats: min={output.min():.4f}, max={output.max():.4f}",
+                    )
+            
+            return StandardCombineInput(hidden_states=output)
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():

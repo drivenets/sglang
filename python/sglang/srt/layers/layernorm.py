@@ -165,12 +165,11 @@ class RMSNorm(CustomOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
-            )
-            return out, residual_out
+            # vllm's fused_add_rms_norm modifies input and residual in-place
+            # Signature: fused_add_rms_norm(input, residual, weight, epsilon)
+            # After call: input contains normalized output, residual contains input + original_residual
+            fused_add_rms_norm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
