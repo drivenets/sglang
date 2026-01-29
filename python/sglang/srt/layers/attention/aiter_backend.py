@@ -20,6 +20,12 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
+# Import sliding window buffer utilities from triton backend
+from sglang.srt.layers.attention.triton_backend import (
+    update_sliding_window_buffer,
+    update_sliding_window_buffer_cuda_graph,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -77,7 +83,10 @@ class ForwardMetadata:
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
     num_kv_splits: Optional[int] = None
-    # num_kv_splits_indptr: Optional[torch.Tensor] = None
+    # Sliding window support
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
+    window_kv_start_idx: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -119,12 +128,16 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
+        
+        # Sliding window support
+        self.sliding_window_size = model_runner.sliding_window_size
 
         max_bs = model_runner.req_to_token_pool.size
 
@@ -141,6 +154,16 @@ class AiterAttnBackend(AttentionBackend):
         self.qo_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
+        
+        # Sliding window buffers - needed for models with sliding window attention
+        self.window_kv_indptr = None
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            if kv_indptr_buf is None:
+                self.window_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
+            else:
+                self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -316,6 +339,11 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = None
         # num_kv_splits_indptr = None
 
+        # Sliding window buffers
+        window_kv_indptr = None
+        window_kv_indices = None
+        window_kv_start_idx = None
+
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -332,6 +360,23 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Compute sliding window buffers if needed
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    window_kv_indptr, window_kv_indices, _, window_kv_start_idx = (
+                        update_sliding_window_buffer(
+                            self.window_kv_indptr,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            forward_batch.seq_lens,
+                            forward_batch.req_pool_indices,
+                            bs,
+                            self.device,
+                            self.token_to_kv_pool_allocator,
+                        )
+                    )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -383,6 +428,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
+                window_kv_indptr=window_kv_indptr,
+                window_kv_indices=window_kv_indices,
+                window_kv_start_idx=window_kv_start_idx,
             )
 
         elif forward_batch.forward_mode.is_draft_extend():
@@ -582,21 +630,73 @@ class AiterAttnBackend(AttentionBackend):
                     self.mla_indices_updater_prefill.max_kv_len,
                 )
             else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=None,
+                # For non-MLA extend with Triton extend_attention_fwd kernel:
+                # - kv_indptr/kv_indices should point to PREFIX (cached) tokens only
+                # - The new tokens are passed directly as k_extend/v_extend
+                # This is different from mha_batch_prefill_func which needs all tokens
+                
+                # Compute kv_indptr and kv_indices based on extend_prefix_lens
+                kv_indptr = self.kv_indptr
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_prefix_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                
+                prefix_lens_sum = sum(forward_batch.extend_prefix_lens_cpu)
+                kv_indices = torch.empty(
+                    prefix_lens_sum if prefix_lens_sum > 0 else 1,  # Avoid empty tensor issues
+                    dtype=torch.int64,
+                    device=self.device,
                 )
+                if prefix_lens_sum > 0:
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.extend_prefix_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                
+                max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+                max_prefix_len = max(forward_batch.extend_prefix_lens_cpu) if forward_batch.extend_prefix_lens_cpu else 0
+                
+                # Compute sliding window buffers for extend if needed
+                # IMPORTANT: Use extend_prefix_lens (cached tokens), NOT seq_lens (total)
+                # For initial prefill with no cached tokens, extend_prefix_lens=0,
+                # so window_kv_indptr=[0,0] and window_kv_indices=[]
+                window_kv_indptr = None
+                window_kv_indices = None
+                window_kv_start_idx = None
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    # For extend, we only need window_kv_indptr and window_kv_indices
+                    # window_kv_offsets should be None (not used for extend)
+                    window_kv_indptr, window_kv_indices, _, _ = (
+                        update_sliding_window_buffer(
+                            self.window_kv_indptr,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            forward_batch.extend_prefix_lens,  # Use prefix lens, not seq_lens!
+                            forward_batch.req_pool_indices,
+                            bs,
+                            self.device,
+                            self.token_to_kv_pool_allocator,
+                        )
+                    )
+                    # Keep as int64 to match Triton's expectation
+                
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
                     None,
                     None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    max_extend_len,
+                    max_prefix_len,
+                    window_kv_indptr=window_kv_indptr,
+                    window_kv_indices=window_kv_indices,
+                    window_kv_start_idx=None,  # Not used for extend
                 )
 
     def init_cuda_graph_state(
@@ -621,6 +721,17 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
+
+        # Sliding window cuda graph buffers
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            if kv_indices_buf is None:
+                self.cuda_graph_window_kv_indices = torch.zeros(
+                    (max_num_tokens * self.sliding_window_size),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
 
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and _use_mla_ps_kernel:
@@ -669,6 +780,11 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map = None
         reduce_partial_map = None
 
+        # Sliding window buffers
+        window_kv_indptr = None
+        window_kv_indices = None
+        window_kv_start_idx = None
+
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
             kv_last_page_len = None
@@ -688,6 +804,24 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Compute sliding window buffers for cuda graph capture
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    window_kv_indices = self.cuda_graph_window_kv_indices
+                    window_kv_indptr, window_kv_indices, _, window_kv_start_idx = (
+                        update_sliding_window_buffer_cuda_graph(
+                            self.window_kv_indptr,
+                            window_kv_indices,
+                            self.req_to_token,
+                            self.sliding_window_size,
+                            seq_lens[:bs],
+                            req_pool_indices,
+                            bs,
+                            self.token_to_kv_pool_allocator,
+                        )
+                    )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -739,7 +873,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
+                window_kv_indptr=window_kv_indptr,
+                window_kv_indices=window_kv_indices,
+                window_kv_start_idx=window_kv_start_idx,
             )
 
         elif forward_mode.is_target_verify():
@@ -927,6 +1063,22 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Update sliding window buffers for cuda graph replay
+                if (
+                    self.sliding_window_size is not None
+                    and self.sliding_window_size > 0
+                ):
+                    window_kv_indices = self.cuda_graph_window_kv_indices
+                    update_sliding_window_buffer_cuda_graph(
+                        self.window_kv_indptr,
+                        window_kv_indices,
+                        self.req_to_token,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        req_pool_indices[:bs],
+                        bs,
+                        self.token_to_kv_pool_allocator,
+                    )
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
@@ -987,7 +1139,10 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
+        if layer.layer_id == 0:
+            logger.info(f"[AITER forward_extend] use_mla={self.use_mla}, layer_id={layer.layer_id}")
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -999,12 +1154,9 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                if self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-                else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                # For non-MLA with Triton extend kernel, don't pass k_scale/v_scale
+                # to match Triton backend behavior
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -1228,35 +1380,82 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
+            # For non-MLA extend, use Triton kernel because Aiter's mha_batch_prefill_func
+            # doesn't support the 2-stage extend pattern (k_extend + k_cache) correctly.
+            # The Aiter kernel applies a standard causal mask (query i -> KV 0..i) but
+            # extend requires bottom-right aligned mask (query 0 at position prefix_len
+            # should attend to KV 0..prefix_len).
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
 
-            bs0 = forward_batch.batch_size + 1
+            if layer.qk_head_dim != layer.v_head_dim:
+                o = q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            else:
+                o = torch.empty_like(q)
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+            # TODO kkhuang-amd need to remove it when extend_attention_fwd support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 dtype = q.dtype
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            # Determine sliding window settings
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                sliding_window_size = layer.sliding_window_size
+                kv_indptr = self.forward_metadata.window_kv_indptr
+                kv_indices = self.forward_metadata.window_kv_indices
+                window_kv_offsets = self.forward_metadata.window_kv_start_idx
+            else:
+                sliding_window_size = -1
+                kv_indptr = self.forward_metadata.kv_indptr
+                kv_indices = self.forward_metadata.kv_indices
+                window_kv_offsets = None
+
+            bs = forward_batch.batch_size
+            bs0 = bs + 1
+            
+            # Compute qo_indptr based on extend lengths (not total seq lens)
+            # This is crucial for correct causal masking
+            qo_indptr = self.qo_indptr
+            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr = qo_indptr[:bs0]
+            
+            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            
+            # Prepare tensors for kernel call
+            # NOTE: Don't call .contiguous() on q - the Triton kernel expects the original stride
+            q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            actual_kv_indptr_call = kv_indptr[:bs0] if kv_indptr is not None else self.forward_metadata.kv_indptr[:bs0]
+            actual_kv_indices_call = kv_indices if kv_indices is not None else self.forward_metadata.kv_indices
+            
+            # Get sinks from kwargs (passed from model)
+            sinks = kwargs.get("sinks", None)
+            
+            self.extend_attention_fwd(
+                q_view,
+                k.contiguous(),
+                v.contiguous(),
+                o_view,
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
+                qo_indptr,
+                actual_kv_indptr_call,
+                actual_kv_indices_call,
+                None,  # custom_mask
+                True,  # is_causal
+                None,  # mask_indptr
+                max_extend_len,
+                layer.scaling,
+                logit_cap=self.logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,  # Pass through from model
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            return o
 
     def forward_decode(
         self,
@@ -1266,6 +1465,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -1341,8 +1541,30 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            # Use FP8 KV cache directly - paged_attention_ragged supports FP8
-            kv_cache_dtype_str = "fp8" if self.kv_cache_dtype == fp8_dtype else "auto"
+            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
+            if self.kv_cache_dtype == fp8_dtype:
+                dtype = q.dtype
+
+                k_cache = k_cache.to(dtype)
+                v_cache = v_cache.to(dtype)
+
+            # For decode with sliding window, we need to use window kv_indptr/kv_indices
+            # because paged_attention_ragged doesn't have a window_size parameter
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                if self.forward_metadata.window_kv_indices is not None:
+                    kv_indptr = self.forward_metadata.window_kv_indptr
+                    # Convert to int32 if needed (aiter requires int32)
+                    kv_indices = self.forward_metadata.window_kv_indices
+                    if kv_indices.dtype != torch.int32:
+                        kv_indices = kv_indices.to(torch.int32)
+                else:
+                    # Fallback to full indices if window not computed
+                    kv_indptr = self.forward_metadata.kv_indptr
+                    kv_indices = self.forward_metadata.kv_indices
+            else:
+                # Full attention - use all KV entries
+                kv_indptr = self.forward_metadata.kv_indptr
+                kv_indices = self.forward_metadata.kv_indices
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -1351,13 +1573,13 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
                 v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
                 self.scale,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
+                kv_indptr,
+                kv_indices,
                 self.kv_last_page_len,
                 1,
                 self.max_num_partitions,
                 None,
-                kv_cache_dtype_str,
+                "auto",
                 "NHD",
                 self.logits_soft_cap,
                 self.k_scale,
