@@ -8,11 +8,8 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang-kernel"
-version = "0.4.2.post1"
-authors = [
-  { name="SGLang Kernel Team", email="sglang@lmsys.org" },
-]
+name = "sgl-kernel"
+version = "0.3.19"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"
