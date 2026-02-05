@@ -39,12 +39,12 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
-    is_sm120_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
@@ -55,57 +55,20 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
-logger = logging.getLogger(__name__)
 
 
 if is_flashinfer_available():
     from flashinfer import (
         mxfp8_quantize,
-        nvfp4_block_scale_interleave,
+        shuffle_matrix_a,
+        shuffle_matrix_sf_a,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
 
-_flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
-_flashinfer_mxfp4_permute_indices_device_cache: dict[
-    tuple[tuple[int, ...], int, int, str, int], torch.Tensor
-] = {}
-
-
-def _get_flashinfer_mxfp4_device_permute_indices(
-    x: torch.Tensor,
-    epilogue_tile_m: int,
-    num_elts_per_sf: Optional[int] = None,
-) -> torch.Tensor:
-    extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
-    permute_indices = get_w2_permute_indices_with_cache(
-        _flashinfer_mxfp4_permute_indices_cache,
-        x,
-        epilogue_tile_m,
-        **extra_args,
-    )
-
-    device_index = -1 if x.device.index is None else x.device.index
-    num_elts_per_sf_key = -1 if num_elts_per_sf is None else num_elts_per_sf
-    cache_key = (
-        tuple(x.shape),
-        epilogue_tile_m,
-        num_elts_per_sf_key,
-        x.device.type,
-        device_index,
-    )
-    cached_device_indices = _flashinfer_mxfp4_permute_indices_device_cache.get(
-        cache_key
-    )
-    if cached_device_indices is None:
-        cached_device_indices = permute_indices.to(x.device)
-        _flashinfer_mxfp4_permute_indices_device_cache[cache_key] = (
-            cached_device_indices
-        )
-
-    return cached_device_indices
-
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -144,42 +107,23 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    if is_sm120_supported():
-        # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
-        # This MXFP4 path uses StridedLayout and the non-persistent kernel with
-        # block_k=128 so the selected tile stays within the per-block shared-memory budget.
-        from triton_kernels.tensor_details.layout import StridedLayout
-
-        value_layout = StridedLayout
-        value_layout_opts = {}
-        scale_layout = StridedLayout
-        scale_layout_opts = {}
+    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+        mx_axis=1
+    )
+    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=1, num_warps=num_warps
+    )
+    if _is_sm100_supported:
         constraints = {
-            "is_persistent": False,
-            "block_k": 128,
-            "num_stages": 1,
+            "is_persistent": True,
+            "epilogue_subtile": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    else:
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-            mx_axis=1
-        )
-        scale_layout, scale_layout_opts = (
-            layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=1, num_warps=num_warps
-            )
-        )
-        if is_sm100_supported():
-            constraints = {
-                "is_persistent": True,
-                "epilogue_subtile": 1,
-            }
-            opt_flags.update_opt_flags_constraints(constraints)
-        elif is_sm90_supported():
-            constraints = {
-                "split_k": 1,
-            }
-            opt_flags.update_opt_flags_constraints(constraints)
+    elif _is_sm90_supported:
+        constraints = {
+            "split_k": 1,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -341,12 +285,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
-        triton_kernels_padding_alignment = 64
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if is_sm100_supported():
+        if _is_sm100_supported:
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, 256
@@ -354,28 +297,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size = round_up(hidden_size, 256)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, triton_kernels_padding_alignment
+                    intermediate_size_per_partition, 64
                 )
         elif _use_aiter:
-            # 32x32 warp tile: K_align=128 for inter (K in gemm2), but hidden
-            # needs N_align=256 (NPerBlock=256 in gemm2 where N=hidden).
-            _use_warp32 = os.environ.get("AITER_MOE_WARP32", "0") != "0"
-            _inter_align = 128 if _use_warp32 else 256
-            _hidden_align = 256  # NPerBlock=256 for both 16x16 and 32x32
 
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, _inter_align
+                intermediate_size_per_partition, 256
             )
 
-            hidden_size = round_up(hidden_size, _hidden_align)
+            hidden_size = round_up(hidden_size, 256)
             self.hidden_pad = hidden_size - layer.hidden_size
             self.intermediate_pad = (
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
         elif has_triton_kernels:
+            # TODO: this is a hack to make
+            # intermediate_size_per_partition_after_pad the same as the
+            # per_rank_intermediate_size during weight loading
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, triton_kernels_padding_alignment
+                intermediate_size_per_partition, mxfp4_block
             )
         elif _is_hip:
             # HIP/ROCm also needs padding to match the weight loading calculation
@@ -458,6 +399,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
+            log_info_on_rank0(
+                logger,
+                f"Shuffling MoE weights for FlashInfer MXFP4 moe kernel (layer: {self.prefix}), it might take a while...",
+            )
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
@@ -549,69 +494,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             gemm1_bias_shuffled = []
             gemm2_bias_shuffled = []
             epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
-            w13_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w13_weight[0].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            w13_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w13_weight_scale[0].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w13_bias[0].reshape(-1, 1),
-                epilogue_tile_m,
-            )
-
-            w2_weight_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w2_weight[0].view(torch.uint8),
-                epilogue_tile_m,
-            )
-            w2_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w2_weight_scale[0].view(torch.uint8),
-                epilogue_tile_m,
-                num_elts_per_sf=16,
-            )
-            w2_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
-                w2_bias[0].reshape(-1, 1),
-                epilogue_tile_m,
-            )
-
             for i in range(self.num_experts):
                 gemm1_weights_mxfp4_shuffled.append(
-                    w13_weight[i]
-                    .view(torch.uint8)[w13_weight_permute_indices]
-                    .contiguous()
+                    shuffle_matrix_a(w13_weight[i].view(torch.uint8), epilogue_tile_m)
                 )
-
                 gemm1_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w13_weight_scale[i]
-                        .view(torch.uint8)[w13_scale_permute_indices]
-                        .contiguous()
+                    shuffle_matrix_sf_a(
+                        w13_weight_scale[i].view(torch.uint8), epilogue_tile_m
                     )
                 )
-
                 gemm1_bias_shuffled.append(
-                    w13_bias[i].reshape(-1, 1)[w13_bias_permute_indices].contiguous()
+                    shuffle_matrix_a(
+                        w13_bias[i].clone().reshape(-1, 1), epilogue_tile_m
+                    )
                 )
 
                 gemm2_weights_mxfp4_shuffled.append(
-                    w2_weight[i]
-                    .view(torch.uint8)[w2_weight_permute_indices]
-                    .contiguous()
+                    shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
                 )
-
                 gemm2_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w2_weight_scale[i]
-                        .view(torch.uint8)[w2_scale_permute_indices]
-                        .contiguous()
+                    shuffle_matrix_sf_a(
+                        w2_weight_scale[i].view(torch.uint8), epilogue_tile_m
                     )
                 )
-
                 gemm2_bias_shuffled.append(
-                    w2_bias[i].reshape(-1, 1)[w2_bias_permute_indices].contiguous()
+                    shuffle_matrix_a(w2_bias[i].clone().reshape(-1, 1), epilogue_tile_m)
                 )
 
             w13_weight = torch.stack(gemm1_weights_mxfp4_shuffled)
@@ -693,21 +600,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .view(e, n, -1)
             )
 
-            _n_lane = 32 if os.environ.get("AITER_MOE_WARP32", "0") != "0" else 16
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, _n_lane, True)
+            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
             shuffled_w13_scale = shuffle_scale_a16w4(
                 layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
                 self.num_experts,
                 True,
-                n_lane=_n_lane,
             )
 
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, _n_lane, False)
+            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
             shuffled_w2_scale = shuffle_scale_a16w4(
                 layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
                 self.num_experts,
                 False,
-                n_lane=_n_lane,
             )
 
             layer.w13_weight_bias.data = (
@@ -825,47 +729,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Get the ORIGINAL intermediate size before mxfp4_block padding
             original_inter = self.intermediate_size_per_partition_original
             
-            # Calculate padding for BOTH 16x16 and 32x32 layouts
-            _hidden_align = 256  # NPerBlock=256 for both 16x16 and 32x32
-            hidden_pad = (_hidden_align - (current_hidden % _hidden_align)) % _hidden_align
+            # Calculate padding needed for CK-tile kernel
+            # hidden_size needs to be divisible by 256 (for K_pk divisible by 128)
+            # intermediate_size needs to be divisible by 256 (for scale K1 divisible by 8)
+            hidden_pad = (256 - (current_hidden % 256)) % 256
+            inter_pad = (256 - (current_inter % 256)) % 256
+            
             padded_hidden = current_hidden + hidden_pad
-
-            _use_dual = os.environ.get("AITER_MOE_DUAL", "0") != "0"
-            _use_warp32 = os.environ.get("AITER_MOE_WARP32", "0") != "0"
-
-            if _use_dual:
-                # Dual layout: create BOTH 16x16 (inter→512) and 32x32 (inter→384)
-                inter_pad_16 = (256 - (current_inter % 256)) % 256
-                inter_pad_32 = (128 - (current_inter % 128)) % 128
-                padded_inter_16 = current_inter + inter_pad_16
-                padded_inter_32 = current_inter + inter_pad_32
-
-                log_info_on_rank0(
-                    logger,
-                    f"  DUAL padding: hidden {current_hidden}→{padded_hidden}, "
-                    f"inter 16x16: {current_inter}→{padded_inter_16}, "
-                    f"inter 32x32: {current_inter}→{padded_inter_32}",
-                )
-
-                # Primary layout uses 16x16 (for decode, the common case)
-                inter_pad = inter_pad_16
-                padded_inter = padded_inter_16
-            else:
-                _inter_align = 128 if _use_warp32 else 256
-                inter_pad = (_inter_align - (current_inter % _inter_align)) % _inter_align
-                padded_inter = current_inter + inter_pad
-
-                log_info_on_rank0(
-                    logger,
-                    f"  Padding: hidden {current_hidden} + {hidden_pad} = {padded_hidden}, inter {current_inter} + {inter_pad} = {padded_inter}, original_inter={original_inter}",
-                )
-
+            padded_inter = current_inter + inter_pad
+            
+            log_info_on_rank0(
+                logger,
+                f"  Padding: hidden {current_hidden} + {hidden_pad} = {padded_hidden}, inter {current_inter} + {inter_pad} = {padded_inter}, original_inter={original_inter}",
+            )
+            
             # Store padding info for forward pass
             layer.hidden_pad = hidden_pad
             layer.intermediate_pad = inter_pad
             layer.original_hidden_size = current_hidden
             layer.original_intermediate_size = current_inter
-
+            
             # Get weight tensors
             w13_weight = layer.w13_weight.data  # [E, 2*inter, hidden//2]
             w13_scale = layer.w13_weight_scale.data  # [E, 2*inter, hidden//32]
@@ -873,138 +756,101 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale = layer.w2_weight_scale.data  # [E, hidden, inter//32]
             w13_bias = layer.w13_weight_bias.data.to(torch.float32)
             w2_bias = layer.w2_weight_bias.data.to(torch.float32)
-
-            def _deinterleave_and_pad(w13_w, w13_s, w13_b, w2_w, w2_s, w2_b, p_inter, p_hidden):
-                """De-interleave GPT-OSS checkpoint layout and pad to target dims."""
-                p_hidden_pk = p_hidden // 2
-                # w13
-                new_w13_w = torch.zeros(
-                    (num_local_experts, 2 * p_inter, p_hidden_pk),
-                    dtype=w13_w.dtype, device=w13_w.device
+            
+            # De-interleave weights - always needed for GPT-OSS checkpoints
+            # The checkpoint layout is INTERLEAVED: [gate_0, up_0, gate_1, up_1, ...]
+            # CK-tile kernel expects SEQUENTIAL: [gate_0, gate_1, ..., up_0, up_1, ...]
+            if hidden_pad > 0 or inter_pad > 0:
+                # De-interleave and pad w13_weight
+                new_w13_weight = torch.zeros(
+                    (num_local_experts, 2 * padded_inter, padded_hidden // 2),
+                    dtype=w13_weight.dtype, device=w13_weight.device
                 )
-                new_w13_w[:, :current_inter, :current_hidden_pk] = w13_w[:, 0::2, :]
-                new_w13_w[:, p_inter:p_inter + current_inter, :current_hidden_pk] = w13_w[:, 1::2, :]
-
-                new_w13_s = torch.zeros(
-                    (num_local_experts, 2 * p_inter, p_hidden // 32),
-                    dtype=w13_s.dtype, device=w13_s.device
+                gate_weights = w13_weight[:, 0::2, :]
+                new_w13_weight[:, :current_inter, :current_hidden_pk] = gate_weights
+                up_weights = w13_weight[:, 1::2, :]
+                new_w13_weight[:, padded_inter:padded_inter + current_inter, :current_hidden_pk] = up_weights
+                w13_weight = new_w13_weight
+                
+                # De-interleave and pad w13_scale
+                new_w13_scale = torch.zeros(
+                    (num_local_experts, 2 * padded_inter, padded_hidden // 32),
+                    dtype=w13_scale.dtype, device=w13_scale.device
                 )
-                new_w13_s[:, :current_inter, :current_hidden // 32] = w13_s[:, 0::2, :]
-                new_w13_s[:, p_inter:p_inter + current_inter, :current_hidden // 32] = w13_s[:, 1::2, :]
-
-                new_w13_b = torch.zeros(
-                    (num_local_experts, 2 * p_inter),
-                    dtype=w13_b.dtype, device=w13_b.device
+                gate_scale = w13_scale[:, 0::2, :]
+                new_w13_scale[:, :current_inter, :current_hidden // 32] = gate_scale
+                up_scale = w13_scale[:, 1::2, :]
+                new_w13_scale[:, padded_inter:padded_inter + current_inter, :current_hidden // 32] = up_scale
+                w13_scale = new_w13_scale
+                
+                # De-interleave and pad w13_bias
+                new_w13_bias = torch.zeros(
+                    (num_local_experts, 2 * padded_inter),
+                    dtype=w13_bias.dtype, device=w13_bias.device
                 )
-                new_w13_b[:, :current_inter] = w13_b[:, 0::2]
-                new_w13_b[:, p_inter:p_inter + current_inter] = w13_b[:, 1::2]
-
-                # w2
-                new_w2_w = torch.zeros(
-                    (num_local_experts, p_hidden, p_inter // 2),
-                    dtype=w2_w.dtype, device=w2_w.device
+                gate_bias = w13_bias[:, 0::2]
+                new_w13_bias[:, :current_inter] = gate_bias
+                up_bias = w13_bias[:, 1::2]
+                new_w13_bias[:, padded_inter:padded_inter + current_inter] = up_bias
+                w13_bias = new_w13_bias
+                
+                # Pad w2_weight
+                new_w2_weight = torch.zeros(
+                    (num_local_experts, padded_hidden, padded_inter // 2),
+                    dtype=w2_weight.dtype, device=w2_weight.device
                 )
-                new_w2_w[:, :current_hidden, :current_inter // 2] = w2_w
-
-                new_w2_s = torch.zeros(
-                    (num_local_experts, p_hidden, p_inter // 32),
-                    dtype=w2_s.dtype, device=w2_s.device
+                new_w2_weight[:, :current_hidden, :current_inter // 2] = w2_weight
+                w2_weight = new_w2_weight
+                
+                # Pad w2_scale
+                new_w2_scale = torch.zeros(
+                    (num_local_experts, padded_hidden, padded_inter // 32),
+                    dtype=w2_scale.dtype, device=w2_scale.device
                 )
-                new_w2_s[:, :current_hidden, :current_inter // 32] = w2_s
-
-                new_w2_b = torch.zeros(
-                    (num_local_experts, p_hidden),
-                    dtype=w2_b.dtype, device=w2_b.device
+                new_w2_scale[:, :current_hidden, :current_inter // 32] = w2_scale
+                w2_scale = new_w2_scale
+                
+                # Pad w2_bias
+                new_w2_bias = torch.zeros(
+                    (num_local_experts, padded_hidden),
+                    dtype=w2_bias.dtype, device=w2_bias.device
                 )
-                new_w2_b[:, :current_hidden] = w2_b
-
-                return new_w13_w, new_w13_s, new_w13_b, new_w2_w, new_w2_s, new_w2_b
-
-            def _shuffle_weights(w13_w, w13_s, w2_w, w2_s, n_lane, p_inter, p_hidden):
-                """Shuffle weights and scales for CK-tile kernel."""
-                w13_ws = shuffle_weight_a16w4(w13_w, n_lane, True)
-                w2_ws = shuffle_weight_a16w4(w2_w, n_lane, False)
-                w13_sf = w13_s.reshape(num_local_experts * 2 * p_inter, p_hidden // 32)
-                w13_ss = shuffle_scale_a16w4(w13_sf, num_local_experts, True, n_lane=n_lane)
-                w13_ss = w13_ss.view(torch.float8_e8m0fnu)
-                w2_sf = w2_s.reshape(num_local_experts * p_hidden, p_inter // 32)
-                w2_ss = shuffle_scale_a16w4(w2_sf, num_local_experts, False, n_lane=n_lane)
-                w2_ss = w2_ss.view(torch.float8_e8m0fnu)
-                return w13_ws, w13_ss, w2_ws, w2_ss
-
-            if _use_dual:
-                # Create BOTH layouts
-                # 16x16 layout (primary, for decode)
-                w13_w16, w13_s16, w13_b16, w2_w16, w2_s16, w2_b16 = \
-                    _deinterleave_and_pad(w13_weight, w13_scale, w13_bias,
-                                          w2_weight, w2_scale, w2_bias,
-                                          padded_inter_16, padded_hidden)
-                w13_ws16, w13_ss16, w2_ws16, w2_ss16 = \
-                    _shuffle_weights(w13_w16, w13_s16, w2_w16, w2_s16,
-                                     16, padded_inter_16, padded_hidden)
-                del w13_w16, w13_s16, w2_w16, w2_s16
-
-                # 32x32 layout (secondary, for prefill)
-                w13_w32, w13_s32, w13_b32, w2_w32, w2_s32, w2_b32 = \
-                    _deinterleave_and_pad(w13_weight, w13_scale, w13_bias,
-                                          w2_weight, w2_scale, w2_bias,
-                                          padded_inter_32, padded_hidden)
-                w13_ws32, w13_ss32, w2_ws32, w2_ss32 = \
-                    _shuffle_weights(w13_w32, w13_s32, w2_w32, w2_s32,
-                                     32, padded_inter_32, padded_hidden)
-                del w13_w32, w13_s32, w2_w32, w2_s32
-
-                # Delete originals
-                del layer.w13_weight, layer.w2_weight
-                del layer.w13_weight_scale, layer.w2_weight_scale
-                del layer.w13_weight_bias, layer.w2_weight_bias
-
-                # Primary (16x16) — used by default (decode)
-                layer.w13_weight = Parameter(w13_ws16, requires_grad=False)
-                layer.w13_weight_scale = Parameter(w13_ss16, requires_grad=False)
-                layer.w2_weight = Parameter(w2_ws16, requires_grad=False)
-                layer.w2_weight_scale = Parameter(w2_ss16, requires_grad=False)
-                layer.w13_weight_bias = Parameter(w13_b16, requires_grad=False)
-                layer.w2_weight_bias = Parameter(w2_b16, requires_grad=False)
-
-                # Secondary (32x32) — used for prefill (large M)
-                layer.w13_weight_32 = Parameter(w13_ws32, requires_grad=False)
-                layer.w13_weight_scale_32 = Parameter(w13_ss32, requires_grad=False)
-                layer.w2_weight_32 = Parameter(w2_ws32, requires_grad=False)
-                layer.w2_weight_scale_32 = Parameter(w2_ss32, requires_grad=False)
-                layer.w13_weight_bias_32 = Parameter(w13_b32, requires_grad=False)
-                layer.w2_weight_bias_32 = Parameter(w2_b32, requires_grad=False)
-
-                layer.hidden_pad = hidden_pad
-                layer.intermediate_pad = inter_pad_16  # primary uses 16x16
-                layer.intermediate_pad_32 = inter_pad_32
-                layer.padded_intermediate_size_32 = padded_inter_32
-                layer.has_dual_moe = True
-            else:
-                # Single layout (original behavior)
-                if hidden_pad > 0 or inter_pad > 0:
-                    w13_weight, w13_scale, w13_bias, w2_weight, w2_scale, w2_bias = \
-                        _deinterleave_and_pad(w13_weight, w13_scale, w13_bias,
-                                              w2_weight, w2_scale, w2_bias,
-                                              padded_inter, padded_hidden)
-
-                _n_lane = 32 if _use_warp32 else 16
-                w13_ws, w13_ss, w2_ws, w2_ss = \
-                    _shuffle_weights(w13_weight, w13_scale, w2_weight, w2_scale,
-                                     _n_lane, padded_inter, padded_hidden)
-
-                del layer.w13_weight, layer.w2_weight
-                del layer.w13_weight_scale, layer.w2_weight_scale
-                del layer.w13_weight_bias, layer.w2_weight_bias
-
-                layer.w13_weight = Parameter(w13_ws, requires_grad=False)
-                layer.w13_weight_scale = Parameter(w13_ss, requires_grad=False)
-                layer.w2_weight = Parameter(w2_ws, requires_grad=False)
-                layer.w2_weight_scale = Parameter(w2_ss, requires_grad=False)
-                layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
-                layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
-                layer.has_dual_moe = False
-
+                new_w2_bias[:, :current_hidden] = w2_bias
+                w2_bias = new_w2_bias
+            
+            # Shuffle weights for CK-tile kernel (a16w4 path)
+            w13_weight_shuffled = shuffle_weight_a16w4(w13_weight, 16, True)  # gate_up=True
+            w2_weight_shuffled = shuffle_weight_a16w4(w2_weight, 16, False)  # gate_up=False
+            
+            # Shuffle scales - need to reshape to [E * N, K // 32] format
+            w13_scale_flat = w13_scale.reshape(
+                num_local_experts * 2 * padded_inter, padded_hidden // 32
+            )
+            w13_scale_shuffled = shuffle_scale_a16w4(w13_scale_flat, num_local_experts, True)
+            # Convert to float8_e8m0fnu (the scale is stored as uint8 in checkpoint but kernel expects e8m0)
+            w13_scale_shuffled = w13_scale_shuffled.view(torch.float8_e8m0fnu)
+            
+            w2_scale_flat = w2_scale.reshape(
+                num_local_experts * padded_hidden, padded_inter // 32
+            )
+            w2_scale_shuffled = shuffle_scale_a16w4(w2_scale_flat, num_local_experts, False)
+            w2_scale_shuffled = w2_scale_shuffled.view(torch.float8_e8m0fnu)
+            
+            # Update layer parameters
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            del layer.w13_weight_bias
+            del layer.w2_weight_bias
+            
+            layer.w13_weight = Parameter(w13_weight_shuffled, requires_grad=False)
+            layer.w13_weight_scale = Parameter(w13_scale_shuffled, requires_grad=False)
+            layer.w2_weight = Parameter(w2_weight_shuffled, requires_grad=False)
+            layer.w2_weight_scale = Parameter(w2_scale_shuffled, requires_grad=False)
+            layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
+            layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
+            
             # Mark as using CK-tile kernel
             layer.use_cktile_mxfp4 = True
             layer.padded_hidden_size = padded_hidden
@@ -1059,13 +905,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
-            origin_hidden_states_dim = x.shape[-1]
             if self.flashinfer_mxfp4_moe_precision == "bf16":
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
 
                 # May be fused later if this code branch is frequently needed
+                origin_hidden_states_dim = x_quant.shape[-1]
                 if self.hidden_size != origin_hidden_states_dim:
                     x_quant = torch.nn.functional.pad(
                         x_quant,
@@ -1089,7 +935,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 num_tokens = x_quant.shape[0]
-                hidden_size = origin_hidden_states_dim
+                hidden_size = (
+                    x_quant.shape[-1] * 2
+                    if x_quant.dtype == torch.uint8
+                    else x_quant.shape[-1]
+                )
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
@@ -1117,7 +967,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size_per_partition,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
-                None,  # routed_scaling_factor
+                None,
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
