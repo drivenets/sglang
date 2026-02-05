@@ -4169,3 +4169,9 @@ def bind_to_closest_numa_node_cuda():
     if is_numa_available() and nvgpu_available():
         node_id = get_current_device_numa_node_cuda()
         numa_bind_to_node(node_id)
+
+
+# Some backends use pytorch version < 2.4.0 which doesn't
+# support `torch.library.custom_op`.
+def supports_custom_op() -> bool:
+    return hasattr(torch.library, "custom_op")

@@ -37,7 +37,11 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+try:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+except (ImportError, AssertionError):
+    # flashinfer not available on ROCm
+    FlashinferDispatcher = None
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -135,6 +139,8 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
         )
     elif a2a_backend.is_flashinfer():
+        if FlashinferDispatcher is None:
+            raise RuntimeError("FlashinferDispatcher is not available on ROCm")
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,

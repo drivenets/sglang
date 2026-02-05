@@ -16,21 +16,32 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
-    FlashinferDispatcher,
-    FlashinferDispatchOutput,
-)
+try:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatcher,
+        FlashinferDispatchOutput,
+    )
+except (ImportError, AssertionError):
+    # flashinfer not available on ROCm
+    FlashinferDispatcher = None
+    FlashinferDispatchOutput = None
 from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
     MooncakeDispatchOutput,
     MooncakeEPDispatcher,
 )
-from sglang.srt.layers.moe.token_dispatcher.moriep import (
-    MoriEPDispatcher,
-    MoriEPNormalCombineInput,
-    MoriEPNormalDispatchOutput,
-)
+try:
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        MoriEPDispatcher,
+        MoriEPNormalCombineInput,
+        MoriEPNormalDispatchOutput,
+    )
+except (ImportError, AssertionError):
+    # moriep may have flashinfer dependencies
+    MoriEPDispatcher = None
+    MoriEPNormalCombineInput = None
+    MoriEPNormalDispatchOutput = None
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
     StandardDispatcher,

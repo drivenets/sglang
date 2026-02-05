@@ -1326,10 +1326,12 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_hip():
+                    self.attention_backend = "aiter"
                 else:
                     self.attention_backend = "triton"
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend", "aiter"]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
