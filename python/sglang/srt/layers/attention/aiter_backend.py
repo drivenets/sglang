@@ -642,10 +642,9 @@ class AiterAttnBackend(AttentionBackend):
                     self.mla_indices_updater_prefill.max_kv_len,
                 )
             else:
-                # For non-MLA extend with Triton extend_attention_fwd kernel:
-                # - kv_indptr/kv_indices should point to PREFIX (cached) tokens only
-                # - The new tokens are passed directly as k_extend/v_extend
-                # This is different from mha_batch_prefill_func which needs all tokens
+                # For non-MLA extend with AITER mha_batch_prefill_func:
+                # - kv_indptr/kv_indices here point to PREFIX tokens for sliding window computation
+                # - forward_extend() computes all-token indices on the fly for the kernel call
                 
                 # Compute kv_indptr and kv_indices based on extend_prefix_lens
                 kv_indptr = self.kv_indptr
@@ -1446,11 +1445,6 @@ class AiterAttnBackend(AttentionBackend):
             # Check if we have prefix tokens to attend to
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             
-            # Debug logging for debugging bad output
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DEBUG] NON-MLA EXTEND: extend_no_prefix={extend_no_prefix}, kv_cache_dtype={self.kv_cache_dtype}, fp8_dtype={fp8_dtype}, is_fp8={self.kv_cache_dtype == fp8_dtype}\n")
-                    f.flush()
             
             # For FP8 KV-cache, try native FP8 for no-prefix case
             if self.kv_cache_dtype == fp8_dtype:
@@ -1542,75 +1536,82 @@ class AiterAttnBackend(AttentionBackend):
                         logger.info(f"[AITER DEBUG] FP8 no-prefix path output: o_fp8 min={o_fp8.min().item():.4f}, max={o_fp8.max().item():.4f}, mean={o_fp8.mean().item():.4f}")
                     return o_fp8.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-                # Has prefix - fall through to Triton BF16 path
-                # mha_batch_prefill_func with FP8 descale params not available in installed aiter
-                # Convert FP8 cache to BF16 for Triton kernel compatibility
+                # Has prefix - fall through to BF16 mha_batch_prefill_func path
+                # Convert FP8 cache to BF16 for AITER batch prefill kernel
                 if layer.layer_id == 0:
-                    logger.info(f"[AITER] FP8 extend-with-prefix: converting cache to BF16 for Triton")
+                    logger.info(f"[AITER] FP8 extend-with-prefix: converting cache to BF16 for mha_batch_prefill")
                 k_cache = k_cache.to(torch.bfloat16)
                 v_cache = v_cache.to(torch.bfloat16)
 
-            # BF16 path: Use Triton extend_attention_fwd kernel (fallback for non-FP8)
-            # This handles the 2-stage pattern (k_extend + k_cache) with proper masking
+            # BF16 path: Use AITER mha_batch_prefill_func with all tokens in cache
+            # Since set_kv_buffer was called above, both prefix and extend tokens
+            # are already in the KV cache. We use seqlen_k to tell the kernel the
+            # total KV length for proper bottom-right aligned causal masking.
 
-            # Compute qo_indptr based on extend lengths (not total seq lens)
-            # This is crucial for correct causal masking
-            qo_indptr = self.qo_indptr
-            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-            qo_indptr = qo_indptr[:bs0]
+            # cu_seqlens_q: cumulative Q lengths (extend tokens only)
+            cu_seqlens_q = self.qo_indptr
+            cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            cu_seqlens_q = cu_seqlens_q[:bs0]
 
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
 
-            # Prepare tensors for kernel call
-            # NOTE: Don't call .contiguous() on q - the Triton kernel expects the original stride
-            q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-            o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            actual_kv_indptr_call = kv_indptr[:bs0] if kv_indptr is not None else self.forward_metadata.kv_indptr[:bs0]
-            actual_kv_indices_call = kv_indices if kv_indices is not None else self.forward_metadata.kv_indices
+            # Compute kv_indptr and kv_page_indices for ALL tokens (prefix + extend)
+            # using seq_lens (total), not extend_prefix_lens (prefix only)
+            all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+            all_kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+
+            total_kv_len = int(all_kv_indptr[bs].item())
+            all_kv_indices = torch.empty(
+                max(total_kv_len, 1), dtype=torch.int32, device=self.device
+            )
+            if total_kv_len > 0:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    all_kv_indptr,
+                    None,
+                    all_kv_indices,
+                    self.req_to_token.stride(0),
+                )
+
+            # seqlen_k: per-sequence total KV length for bottom-right causal masking
+            seqlen_k = forward_batch.seq_lens[:bs].to(torch.int32)
+            max_seqlen_k = max(forward_batch.seq_lens_cpu)
 
             # Get sinks from kwargs (passed from model)
             sinks = kwargs.get("sinks", None)
+            sink_ptr = None
+            if sinks is not None:
+                sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
 
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DEBUG] Calling extend_attention_fwd: q_view={q_view.shape}, k={k.shape}, v={v.shape}, o_view={o_view.shape}, k_cache={k_cache.shape}, v_cache={v_cache.shape}\n")
-                    f.write(f"[AITER DEBUG] qo_indptr={qo_indptr[:bs0+1].tolist()}, kv_indptr={actual_kv_indptr_call[:bs0+1].tolist()}, max_extend_len={max_extend_len}\n")
-                    f.write(f"[AITER DEBUG] sinks={sinks}, sliding_window_size={sliding_window_size}\n")
-                    f.write(f"[AITER DEBUG] q_view stats: min={q_view.min().item():.4f}, max={q_view.max().item():.4f}, mean={q_view.mean().item():.4f}\n")
-                    f.write(f"[AITER DEBUG] k stats: min={k.min().item():.4f}, max={k.max().item():.4f}, mean={k.mean().item():.4f}\n")
-                    f.write(f"[AITER DEBUG] v stats: min={v.min().item():.4f}, max={v.max().item():.4f}, mean={v.mean().item():.4f}\n")
-                    f.write(f"[AITER DEBUG] k_cache dtype={k_cache.dtype}, v_cache dtype={v_cache.dtype}\n")
-                    f.write(f"[AITER DEBUG] actual_kv_indices_call shape={actual_kv_indices_call.shape if actual_kv_indices_call is not None else None}\n")
-                    f.flush()
+            # Compute window_size tuple for mha_batch_prefill_func
+            # window_size = (window_left, window_right)
+            if sliding_window_size > 0:
+                window_size = (sliding_window_size, 0)
+            else:
+                window_size = (-1, -1)
 
-            self.extend_attention_fwd(
+            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+            o_aiter = mha_batch_prefill_func(
                 q_view,
-                k.contiguous(),
-                v.contiguous(),
-                o_view,
                 k_cache,
                 v_cache,
-                qo_indptr,
-                actual_kv_indptr_call,
-                actual_kv_indices_call,
-                None,  # custom_mask
-                True,  # is_causal
-                None,  # mask_indptr
+                cu_seqlens_q,
+                all_kv_indptr,
+                all_kv_indices,
                 max_extend_len,
-                layer.scaling,
-                logit_cap=self.logits_soft_cap,
-                sliding_window_size=sliding_window_size,
-                sinks=sinks,  # Pass through from model
-                window_kv_offsets=window_kv_offsets,
-                xai_temperature_len=layer.xai_temperature_len,
+                max_seqlen_k,
+                softmax_scale=layer.scaling,
+                logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                causal=True,
+                window_size=window_size,
+                seqlen_k=seqlen_k,
+                sink_ptr=sink_ptr,
             )
 
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DEBUG] extend_attention_fwd output: o_view min={o_view.min().item():.4f}, max={o_view.max().item():.4f}, mean={o_view.mean().item():.4f}\n")
-                    f.flush()
-
-            return o
+            return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -1775,12 +1776,6 @@ class AiterAttnBackend(AttentionBackend):
                     sink_ptr = sinks.to(torch.float32)
                 else:
                     sink_ptr = sinks
-
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DECODE] q shape={q.shape}, kv_indptr={kv_indptr[:5].tolist()}, kv_indices[:10]={kv_indices[:min(10, len(kv_indices))].tolist()}\n")
-                    f.write(f"[AITER DECODE] k_cache dtype={k_cache.dtype}, sliding_window={layer.sliding_window_size}, has_sinks={sink_ptr is not None}\n")
-                    f.flush()
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
