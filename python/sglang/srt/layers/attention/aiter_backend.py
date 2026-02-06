@@ -1446,9 +1446,11 @@ class AiterAttnBackend(AttentionBackend):
             # Check if we have prefix tokens to attend to
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             
-            # Debug logging disabled for performance
-            # if layer.layer_id == 0:
-            #     logger.info(f"[AITER] extend_no_prefix={extend_no_prefix}, prefix_lens={forward_batch.extend_prefix_lens_cpu}, seq_lens={forward_batch.extend_seq_lens_cpu}")
+            # Debug logging for debugging bad output
+            if layer.layer_id == 0:
+                with open("/tmp/aiter_debug.txt", "a") as f:
+                    f.write(f"[AITER DEBUG] NON-MLA EXTEND: extend_no_prefix={extend_no_prefix}, kv_cache_dtype={self.kv_cache_dtype}, fp8_dtype={fp8_dtype}, is_fp8={self.kv_cache_dtype == fp8_dtype}\n")
+                    f.flush()
             
             # For FP8 KV-cache, try native FP8 for no-prefix case
             if self.kv_cache_dtype == fp8_dtype:
@@ -1536,6 +1538,8 @@ class AiterAttnBackend(AttentionBackend):
                         except Exception as e:
                             logger.warning(f"[FP8 Debug] BF16 comparison failed: {e}")
                     
+                    if layer.layer_id == 0:
+                        logger.info(f"[AITER DEBUG] FP8 no-prefix path output: o_fp8 min={o_fp8.min().item():.4f}, max={o_fp8.max().item():.4f}, mean={o_fp8.mean().item():.4f}")
                     return o_fp8.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
                 # Has prefix - fall through to Triton BF16 path
@@ -1567,6 +1571,18 @@ class AiterAttnBackend(AttentionBackend):
             # Get sinks from kwargs (passed from model)
             sinks = kwargs.get("sinks", None)
 
+            if layer.layer_id == 0:
+                with open("/tmp/aiter_debug.txt", "a") as f:
+                    f.write(f"[AITER DEBUG] Calling extend_attention_fwd: q_view={q_view.shape}, k={k.shape}, v={v.shape}, o_view={o_view.shape}, k_cache={k_cache.shape}, v_cache={v_cache.shape}\n")
+                    f.write(f"[AITER DEBUG] qo_indptr={qo_indptr[:bs0+1].tolist()}, kv_indptr={actual_kv_indptr_call[:bs0+1].tolist()}, max_extend_len={max_extend_len}\n")
+                    f.write(f"[AITER DEBUG] sinks={sinks}, sliding_window_size={sliding_window_size}\n")
+                    f.write(f"[AITER DEBUG] q_view stats: min={q_view.min().item():.4f}, max={q_view.max().item():.4f}, mean={q_view.mean().item():.4f}\n")
+                    f.write(f"[AITER DEBUG] k stats: min={k.min().item():.4f}, max={k.max().item():.4f}, mean={k.mean().item():.4f}\n")
+                    f.write(f"[AITER DEBUG] v stats: min={v.min().item():.4f}, max={v.max().item():.4f}, mean={v.mean().item():.4f}\n")
+                    f.write(f"[AITER DEBUG] k_cache dtype={k_cache.dtype}, v_cache dtype={v_cache.dtype}\n")
+                    f.write(f"[AITER DEBUG] actual_kv_indices_call shape={actual_kv_indices_call.shape if actual_kv_indices_call is not None else None}\n")
+                    f.flush()
+
             self.extend_attention_fwd(
                 q_view,
                 k.contiguous(),
@@ -1588,6 +1604,11 @@ class AiterAttnBackend(AttentionBackend):
                 window_kv_offsets=window_kv_offsets,
                 xai_temperature_len=layer.xai_temperature_len,
             )
+
+            if layer.layer_id == 0:
+                with open("/tmp/aiter_debug.txt", "a") as f:
+                    f.write(f"[AITER DEBUG] extend_attention_fwd output: o_view min={o_view.min().item():.4f}, max={o_view.max().item():.4f}, mean={o_view.mean().item():.4f}\n")
+                    f.flush()
 
             return o
 
@@ -1744,6 +1765,23 @@ class AiterAttnBackend(AttentionBackend):
                 decode_k_scale = self.k_scale
                 decode_v_scale = self.v_scale
 
+            # Get sinks from kwargs (passed from model for attention sink support)
+            sinks = kwargs.get("sinks", None)
+            
+            # Convert sinks to float32 if provided (kernel expects float32)
+            sink_ptr = None
+            if sinks is not None:
+                if sinks.dtype != torch.float32:
+                    sink_ptr = sinks.to(torch.float32)
+                else:
+                    sink_ptr = sinks
+
+            if layer.layer_id == 0:
+                with open("/tmp/aiter_debug.txt", "a") as f:
+                    f.write(f"[AITER DECODE] q shape={q.shape}, kv_indptr={kv_indptr[:5].tolist()}, kv_indices[:10]={kv_indices[:min(10, len(kv_indices))].tolist()}\n")
+                    f.write(f"[AITER DECODE] k_cache dtype={k_cache.dtype}, sliding_window={layer.sliding_window_size}, has_sinks={sink_ptr is not None}\n")
+                    f.flush()
+
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 self.workspace_buffer,
@@ -1764,6 +1802,7 @@ class AiterAttnBackend(AttentionBackend):
                 decode_v_scale,  # Use per-layer dynamic scale
                 None,
                 _AITER_PARTITION_SIZE_ROCM,
+                sink_ptr=sink_ptr,  # Pass attention sinks to kernel
             )
 
         return o
