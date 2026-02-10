@@ -233,8 +233,26 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
-        self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
-            self.device
+        # Pre-allocate scale tensors for FP8 - separate tensors to allow independent updates
+        self.k_scale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+        self.v_scale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+        self.q_descale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+
+        # Per-layer FP8 KV scales — pre-allocated GPU tensors for CUDA graph safety.
+        # Updated during extend (non-graph) via .copy_(), reused during decode (graph).
+        num_layers = model_runner.model_config.num_hidden_layers
+        self._fp8_k_scale_per_layer = torch.ones(
+            num_layers, dtype=torch.float32, device=self.device
+        )
+        self._fp8_v_scale_per_layer = torch.ones(
+            num_layers, dtype=torch.float32, device=self.device
+        )
+        # Persistent 1-element buffers for decode attention (never re-allocated)
+        self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._fp8_safe_max = 400.0  # Safe max for FP8 E4M3 (actual max is 448)
+        self._fp8_safe_max_t = torch.tensor(
+            [self._fp8_safe_max], dtype=torch.float32, device=self.device
         )
 
         self.logits_soft_cap = 0.0
@@ -2152,6 +2170,22 @@ class AiterAttnBackend(AttentionBackend):
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
+                    # Compute dynamic scales for FP8 KV cache
+                    if self.kv_cache_dtype == fp8_dtype:
+                        k_absmax = k.abs().amax()
+                        v_absmax = v.abs().amax()
+                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
+                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                        lid = layer.layer_id
+                        self._fp8_k_scale_per_layer[lid] = torch.maximum(
+                            self._fp8_k_scale_per_layer[lid], k_scale
+                        )
+                        self._fp8_v_scale_per_layer[lid] = torch.maximum(
+                            self._fp8_v_scale_per_layer[lid], v_scale
+                        )
+                        k_descale = self._fp8_k_scale_per_layer[lid].item()
+                        v_descale = self._fp8_v_scale_per_layer[lid].item()
+
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_descale, v_descale
                     )
@@ -2617,6 +2651,17 @@ class AiterAttnBackend(AttentionBackend):
                     k_cache = k_cache.to(self.input_dtype)
                     v_cache = v_cache.to(self.input_dtype)
 
+                # Get per-layer FP8 scales for decode (CUDA graph safe)
+                if self.kv_cache_dtype == fp8_dtype:
+                    lid = layer.layer_id
+                    self._decode_k_scale_buf.copy_(self._fp8_k_scale_per_layer[lid:lid+1])
+                    self._decode_v_scale_buf.copy_(self._fp8_v_scale_per_layer[lid:lid+1])
+                    decode_k_scale = self._decode_k_scale_buf
+                    decode_v_scale = self._decode_v_scale_buf
+                else:
+                    decode_k_scale = self.k_scale
+                    decode_v_scale = self.v_scale
+
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     self.workspace_buffer,
@@ -2633,10 +2678,11 @@ class AiterAttnBackend(AttentionBackend):
                     "auto",
                     "NHD",
                     self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
+                    decode_k_scale,
+                    decode_v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
+                    sink_ptr=sinks,
                 )
 
         return o
