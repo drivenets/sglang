@@ -1531,12 +1531,50 @@ class AiterAttnBackend(AttentionBackend):
 
             bs = forward_batch.batch_size
             bs0 = bs + 1
-            
+
             # Check if we have prefix tokens to attend to
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            
-            
-            # cu_seqlens_q: cumulative Q lengths (extend tokens only)
+
+            # Determine sliding window settings
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                sliding_window_size = layer.sliding_window_size
+            else:
+                sliding_window_size = -1
+
+            # FP8 fast path: for no-prefix extends, use fresh BF16 Q/K/V
+            # directly (like vLLM's pure prefill path). This avoids reading
+            # from the FP8 cache entirely — the KV cache was already written
+            # above, and Q/K have RoPE applied in-place by the fused kernel.
+            if extend_no_prefix and self.kv_cache_dtype == fp8_dtype:
+                cu_seqlens = self.qo_indptr
+                cu_seqlens[1 : bs + 1] = torch.cumsum(
+                    forward_batch.extend_seq_lens, dim=0
+                )
+                cu_seqlens = cu_seqlens[:bs0]
+                max_len = max(forward_batch.extend_seq_lens_cpu)
+
+                q_view = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                )
+
+                # k, v are already 3D (T, KH, D) in BF16 with RoPE applied.
+                # Self-attention on fresh tokens — no FP8 cache read needed.
+                o = flash_attn_varlen_func(
+                    q_view,
+                    k,
+                    v,
+                    cu_seqlens,
+                    cu_seqlens,  # same as Q — pure self-attention
+                    max_len,
+                    max_len,
+                    min_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # Fallback: read from KV cache via mha_batch_prefill_func
+            # (used for BF16 cache or extends with prefix)
             cu_seqlens_q = self.qo_indptr
             cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             cu_seqlens_q = cu_seqlens_q[:bs0]
@@ -1544,7 +1582,6 @@ class AiterAttnBackend(AttentionBackend):
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
 
             # Compute kv_indptr and kv_page_indices for ALL tokens (prefix + extend)
-            # using seq_lens (total), not extend_prefix_lens (prefix only)
             all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
             all_kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
 
@@ -1563,17 +1600,14 @@ class AiterAttnBackend(AttentionBackend):
                     self.req_to_token.stride(0),
                 )
 
-            # seqlen_k: per-sequence total KV length for bottom-right causal masking
             seqlen_k = forward_batch.seq_lens[:bs].to(torch.int32)
             max_seqlen_k = max(forward_batch.seq_lens_cpu)
 
-            # Get sinks from kwargs (passed from model)
             sinks = kwargs.get("sinks", None)
             sink_ptr = None
             if sinks is not None:
                 sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
 
-            # Compute window_size tuple for mha_batch_prefill_func
             if sliding_window_size > 0:
                 window_size = (sliding_window_size, 0)
             else:
@@ -1581,9 +1615,7 @@ class AiterAttnBackend(AttentionBackend):
 
             q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-            # FP8 KV cache: convert to BF16 for mha_batch_prefill_func
-            # (kernel requires Q/K same dtype; decode uses paged_attention_ragged
-            # which supports FP8 natively and avoids this conversion)
+            # FP8 with prefix: fall back to full buffer conversion
             if self.kv_cache_dtype == fp8_dtype:
                 k_cache = k_cache.to(torch.bfloat16)
                 v_cache = v_cache.to(torch.bfloat16)
