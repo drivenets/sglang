@@ -5,6 +5,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
