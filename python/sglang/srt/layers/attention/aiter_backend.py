@@ -46,6 +46,14 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+try:
+    from aiter.ops.triton.fusions.fused_kv_cache import (
+        fused_qk_rope_reshape_and_cache,
+    )
+    _has_fused_rope_cache = True
+except ImportError:
+    _has_fused_rope_cache = False
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
@@ -92,7 +100,7 @@ class ForwardMetadata:
 
 global_workspace_buffer = None
 
-_AITER_PARTITION_SIZE_ROCM = 256
+_AITER_PARTITION_SIZE_ROCM = 128
 
 
 class AiterAttnBackend(AttentionBackend):
@@ -203,10 +211,22 @@ class AiterAttnBackend(AttentionBackend):
         self.v_scale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
         self.q_descale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
 
-        # Per-layer FP8 KV scales for dynamic scaling
-        # Stores running max of K/V values to compute proper FP8 scales
-        self._fp8_kv_scales = {}  # Dict[layer_id, Tuple[k_scale, v_scale]]
+        # Per-layer FP8 KV scales — pre-allocated GPU tensors for CUDA graph safety.
+        # Updated during extend (non-graph) via .copy_(), reused during decode (graph).
+        num_layers = model_runner.model_config.num_hidden_layers
+        self._fp8_k_scale_per_layer = torch.ones(
+            num_layers, dtype=torch.float32, device=self.device
+        )
+        self._fp8_v_scale_per_layer = torch.ones(
+            num_layers, dtype=torch.float32, device=self.device
+        )
+        # Persistent 1-element buffers for decode attention (never re-allocated)
+        self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._fp8_safe_max = 400.0  # Safe max for FP8 E4M3 (actual max is 448)
+        self._fp8_safe_max_t = torch.tensor(
+            [self._fp8_safe_max], dtype=torch.float32, device=self.device
+        )
 
         self.logits_soft_cap = 0.0
 
@@ -642,10 +662,9 @@ class AiterAttnBackend(AttentionBackend):
                     self.mla_indices_updater_prefill.max_kv_len,
                 )
             else:
-                # For non-MLA extend with Triton extend_attention_fwd kernel:
-                # - kv_indptr/kv_indices should point to PREFIX (cached) tokens only
-                # - The new tokens are passed directly as k_extend/v_extend
-                # This is different from mha_batch_prefill_func which needs all tokens
+                # For non-MLA extend with AITER mha_batch_prefill_func:
+                # - kv_indptr/kv_indices here point to PREFIX tokens for sliding window computation
+                # - forward_extend() computes all-token indices on the fly for the kernel call
                 
                 # Compute kv_indptr and kv_indices based on extend_prefix_lens
                 kv_indptr = self.kv_indptr
@@ -1143,6 +1162,68 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _apply_fused_rope_and_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+    ):
+        """Apply fused RoPE + KV cache write using aiter kernel.
+
+        This replaces separate RoPE application (in model) + set_kv_buffer (here)
+        with a single fused kernel call that does both in one pass.
+        """
+        num_tokens = k.shape[0]
+
+        # Reshape q to 3D: (T, QH, D) for the fused kernel
+        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        # k and v are already 3D from RadixAttention.forward: (T, KH, D)
+
+        # Get cos/sin from the stored RoPE info
+        cos_cache = layer._fused_rope_cos   # (max_pos, 1, 1, D//2)
+        sin_cache = layer._fused_rope_sin   # (max_pos, 1, 1, D//2)
+        is_neox = layer._fused_rope_is_neox
+        positions = layer._fused_rope_positions[:num_tokens]
+
+        # Get KV cache buffers and reshape for flash_layout (block_size=1)
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # View as FP8 if KV cache is FP8
+        if self.kv_cache_dtype == fp8_dtype:
+            k_cache = k_cache.view(self.kv_cache_dtype)
+            v_cache = v_cache.view(self.kv_cache_dtype)
+
+        # Reshape from (pool_size, KH, D) to (pool_size, 1, KH, D) for block_size=1
+        k_cache_4d = k_cache.unsqueeze(1)
+        v_cache_4d = v_cache.unsqueeze(1)
+
+        # Apply fused kernel: RoPE on q,k + write k,v to cache
+        # q_3d and k are views of the original tensors so in-place update
+        # propagates back to the caller.
+        fused_qk_rope_reshape_and_cache(
+            q_3d,                   # (T, QH, D) -- RoPE applied in-place via q_out
+            k,                      # (T, KH, D) -- RoPE applied in-place via k_out
+            v,                      # (T, KH, D) -- written to cache
+            k_cache_4d,             # (pool_size, 1, KH, D)
+            v_cache_4d,             # (pool_size, 1, KH, D)
+            cache_loc,              # (T,) slot mapping
+            positions,              # (T,) token positions
+            cos_cache,              # (max_pos, 1, 1, D//2)
+            sin_cache,              # (max_pos, 1, 1, D//2)
+            self.k_scale,           # k_scale
+            self.v_scale,           # v_scale
+            is_neox,
+            flash_layout=True,
+            apply_scale=(self.kv_cache_dtype == fp8_dtype),
+            q_out=q_3d,            # in-place (same storage as q)
+            k_out=k,               # in-place
+            output_zeros=False,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1167,34 +1248,42 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                # Compute dynamic scales for FP8 KV cache
-                k_scale_val = None
-                v_scale_val = None
-                if self.kv_cache_dtype == fp8_dtype:
-                    k_absmax = k.abs().max().item()
-                    v_absmax = v.abs().max().item()
-
-                    # Compute scale if values exceed FP8 safe range
-                    # scale = max_val / fp8_safe_max, values stored as: val / scale
-                    # During decode: val * scale to restore
-                    k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
-                    v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
-
-                    # Update running max scale for this layer
-                    if layer.layer_id in self._fp8_kv_scales:
-                        old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
-                        k_scale_val = max(k_scale_val, old_k_scale)
-                        v_scale_val = max(v_scale_val, old_v_scale)
-                    self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
-
-                    # Debug logging disabled for performance
-                    # if layer.layer_id == 0:
-                    #     logger.info(f"[FP8 Scale] Layer {layer.layer_id}: K |max|={k_absmax:.1f}, V |max|={v_absmax:.1f}, k_scale={k_scale_val:.4f}, v_scale={v_scale_val:.4f}")
-
-                # Pass scales to set_kv_buffer for proper FP8 quantization
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                # Check if fused RoPE + KV cache write is available
+                _has_fused_rope = (
+                    _has_fused_rope_cache
+                    and hasattr(layer, '_fused_rope_cos')
+                    and not self.use_mla
                 )
+                if _has_fused_rope:
+                    # Fused path: apply RoPE and write to cache in one kernel
+                    self._apply_fused_rope_and_cache(
+                        q, k, v, layer, forward_batch, cache_loc
+                    )
+                else:
+                    # Original path: separate RoPE (already applied) + set_kv_buffer
+                    k_scale_val = None
+                    v_scale_val = None
+                    if self.kv_cache_dtype == fp8_dtype:
+                        # Compute dynamic scales on GPU, store in per-layer tensors
+                        k_absmax = k.abs().amax()
+                        v_absmax = v.abs().amax()
+                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
+                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                        # Update running max (extend is not graph-captured)
+                        lid = layer.layer_id
+                        self._fp8_k_scale_per_layer[lid] = torch.maximum(
+                            self._fp8_k_scale_per_layer[lid], k_scale
+                        )
+                        self._fp8_v_scale_per_layer[lid] = torch.maximum(
+                            self._fp8_v_scale_per_layer[lid], v_scale
+                        )
+                        # .item() OK here — extend path is never graph-captured
+                        k_scale_val = self._fp8_k_scale_per_layer[lid].item()
+                        v_scale_val = self._fp8_v_scale_per_layer[lid].item()
+
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                    )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -1446,171 +1535,77 @@ class AiterAttnBackend(AttentionBackend):
             # Check if we have prefix tokens to attend to
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             
-            # Debug logging for debugging bad output
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DEBUG] NON-MLA EXTEND: extend_no_prefix={extend_no_prefix}, kv_cache_dtype={self.kv_cache_dtype}, fp8_dtype={fp8_dtype}, is_fp8={self.kv_cache_dtype == fp8_dtype}\n")
-                    f.flush()
             
-            # For FP8 KV-cache, try native FP8 for no-prefix case
-            if self.kv_cache_dtype == fp8_dtype:
-                if extend_no_prefix:
-                    # Native FP8 path - no prefix, just new tokens
-                    cu_seqlens_local = torch.zeros(bs0, dtype=torch.int32, device=q.device)
-                    cu_seqlens_local[1:bs0] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-                    max_seqlen = max(forward_batch.extend_seq_lens_cpu)
-                    
-                    # Reshape for attention
-                    q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                    k_view = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-                    v_view = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                    
-                    # Dynamic scaling for FP8 conversion
-                    # FP8 E4M3 max is 448, use 400 as safe max to avoid edge cases
-                    fp8_safe_max = 400.0
-                    
-                    q_max = q_view.abs().max().item()
-                    k_max = k_view.abs().max().item()
-                    v_max = v_view.abs().max().item()
-                    
-                    # Compute scales (only scale if needed)
-                    q_scale = max(q_max / fp8_safe_max, 1.0)
-                    k_scale_val = max(k_max / fp8_safe_max, 1.0)
-                    v_scale_val = max(v_max / fp8_safe_max, 1.0)
-                    
-                    # Scale tensors before FP8 conversion
-                    if q_scale > 1.0:
-                        q_view = q_view / q_scale
-                    if k_scale_val > 1.0:
-                        k_view = k_view / k_scale_val
-                    if v_scale_val > 1.0:
-                        v_view = v_view / v_scale_val
-                    
-                    # Convert to FP8
-                    q_fp8 = q_view.to(fp8_dtype)
-                    k_fp8 = k_view.to(fp8_dtype)
-                    v_fp8 = v_view.to(fp8_dtype)
-                    
-                    # Create descale tensors for the kernel
-                    # descale values are MULTIPLIERS to dequantize FP8 values
-                    # If we scaled down by X before FP8 conversion, we need descale=X to scale back up
-                    # Note: q_descale and k_descale affect attention scores, v_descale affects output
-                    q_descale_dyn = torch.tensor([q_scale], dtype=torch.float32, device=q.device)
-                    k_descale_dyn = torch.tensor([k_scale_val], dtype=torch.float32, device=q.device)
-                    v_descale_dyn = torch.tensor([v_scale_val], dtype=torch.float32, device=q.device)
-                    
-                    o_fp8 = flash_attn_varlen_fp8_pertensor_func(
-                        q_fp8,
-                        k_fp8,
-                        v_fp8,
-                        q_descale_dyn,
-                        k_descale_dyn,
-                        v_descale_dyn,
-                        cu_seqlens_local,
-                        cu_seqlens_local,
-                        max_seqlen,
-                        max_seqlen,
-                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
-                        causal=True,
-                        softmax_scale=layer.scaling,
-                    )
-                    
-                    # Debug: Compare with BF16 reference for layer 0
-                    # Skip when max_seqlen=1 as BF16 kernel doesn't support it
-                    if layer.layer_id == 0 and not hasattr(self, '_fp8_debug_count'):
-                        self._fp8_debug_count = 0
-                    if layer.layer_id == 0 and self._fp8_debug_count < 3 and max_seqlen > 1:
-                        self._fp8_debug_count += 1
-                        # Run BF16 reference
-                        try:
-                            o_bf16 = flash_attn_varlen_func(
-                                q_view, k_view, v_view,
-                                cu_seqlens_local, cu_seqlens_local,
-                                max_seqlen, max_seqlen,
-                                softmax_scale=layer.scaling,
-                                causal=True,
-                            )
-                            cos_sim = torch.nn.functional.cosine_similarity(
-                                o_fp8.flatten().unsqueeze(0).float(),
-                                o_bf16.flatten().unsqueeze(0).float()
-                            ).item()
-                            logger.info(f"[FP8 Debug] Layer 0: FP8 vs BF16 cos_sim={cos_sim:.6f}, o_fp8 range=[{o_fp8.min():.4f}, {o_fp8.max():.4f}]")
-                        except Exception as e:
-                            logger.warning(f"[FP8 Debug] BF16 comparison failed: {e}")
-                    
-                    if layer.layer_id == 0:
-                        logger.info(f"[AITER DEBUG] FP8 no-prefix path output: o_fp8 min={o_fp8.min().item():.4f}, max={o_fp8.max().item():.4f}, mean={o_fp8.mean().item():.4f}")
-                    return o_fp8.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-                # Has prefix - fall through to Triton BF16 path
-                # mha_batch_prefill_func with FP8 descale params not available in installed aiter
-                # Convert FP8 cache to BF16 for Triton kernel compatibility
-                if layer.layer_id == 0:
-                    logger.info(f"[AITER] FP8 extend-with-prefix: converting cache to BF16 for Triton")
-                k_cache = k_cache.to(torch.bfloat16)
-                v_cache = v_cache.to(torch.bfloat16)
-
-            # BF16 path: Use Triton extend_attention_fwd kernel (fallback for non-FP8)
-            # This handles the 2-stage pattern (k_extend + k_cache) with proper masking
-
-            # Compute qo_indptr based on extend lengths (not total seq lens)
-            # This is crucial for correct causal masking
-            qo_indptr = self.qo_indptr
-            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-            qo_indptr = qo_indptr[:bs0]
+            # cu_seqlens_q: cumulative Q lengths (extend tokens only)
+            cu_seqlens_q = self.qo_indptr
+            cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            cu_seqlens_q = cu_seqlens_q[:bs0]
 
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
 
-            # Prepare tensors for kernel call
-            # NOTE: Don't call .contiguous() on q - the Triton kernel expects the original stride
-            q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-            o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            actual_kv_indptr_call = kv_indptr[:bs0] if kv_indptr is not None else self.forward_metadata.kv_indptr[:bs0]
-            actual_kv_indices_call = kv_indices if kv_indices is not None else self.forward_metadata.kv_indices
+            # Compute kv_indptr and kv_page_indices for ALL tokens (prefix + extend)
+            # using seq_lens (total), not extend_prefix_lens (prefix only)
+            all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+            all_kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+
+            total_kv_len = int(all_kv_indptr[bs].item())
+            all_kv_indices = torch.empty(
+                max(total_kv_len, 1), dtype=torch.int32, device=self.device
+            )
+            if total_kv_len > 0:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    all_kv_indptr,
+                    None,
+                    all_kv_indices,
+                    self.req_to_token.stride(0),
+                )
+
+            # seqlen_k: per-sequence total KV length for bottom-right causal masking
+            seqlen_k = forward_batch.seq_lens[:bs].to(torch.int32)
+            max_seqlen_k = max(forward_batch.seq_lens_cpu)
 
             # Get sinks from kwargs (passed from model)
             sinks = kwargs.get("sinks", None)
+            sink_ptr = None
+            if sinks is not None:
+                sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
 
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DEBUG] Calling extend_attention_fwd: q_view={q_view.shape}, k={k.shape}, v={v.shape}, o_view={o_view.shape}, k_cache={k_cache.shape}, v_cache={v_cache.shape}\n")
-                    f.write(f"[AITER DEBUG] qo_indptr={qo_indptr[:bs0+1].tolist()}, kv_indptr={actual_kv_indptr_call[:bs0+1].tolist()}, max_extend_len={max_extend_len}\n")
-                    f.write(f"[AITER DEBUG] sinks={sinks}, sliding_window_size={sliding_window_size}\n")
-                    f.write(f"[AITER DEBUG] q_view stats: min={q_view.min().item():.4f}, max={q_view.max().item():.4f}, mean={q_view.mean().item():.4f}\n")
-                    f.write(f"[AITER DEBUG] k stats: min={k.min().item():.4f}, max={k.max().item():.4f}, mean={k.mean().item():.4f}\n")
-                    f.write(f"[AITER DEBUG] v stats: min={v.min().item():.4f}, max={v.max().item():.4f}, mean={v.mean().item():.4f}\n")
-                    f.write(f"[AITER DEBUG] k_cache dtype={k_cache.dtype}, v_cache dtype={v_cache.dtype}\n")
-                    f.write(f"[AITER DEBUG] actual_kv_indices_call shape={actual_kv_indices_call.shape if actual_kv_indices_call is not None else None}\n")
-                    f.flush()
+            # Compute window_size tuple for mha_batch_prefill_func
+            if sliding_window_size > 0:
+                window_size = (sliding_window_size, 0)
+            else:
+                window_size = (-1, -1)
 
-            self.extend_attention_fwd(
+            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+            # FP8 KV cache: convert to BF16 for mha_batch_prefill_func
+            # (kernel requires Q/K same dtype; decode uses paged_attention_ragged
+            # which supports FP8 natively and avoids this conversion)
+            if self.kv_cache_dtype == fp8_dtype:
+                k_cache = k_cache.to(torch.bfloat16)
+                v_cache = v_cache.to(torch.bfloat16)
+
+            o_aiter = mha_batch_prefill_func(
                 q_view,
-                k.contiguous(),
-                v.contiguous(),
-                o_view,
                 k_cache,
                 v_cache,
-                qo_indptr,
-                actual_kv_indptr_call,
-                actual_kv_indices_call,
-                None,  # custom_mask
-                True,  # is_causal
-                None,  # mask_indptr
+                cu_seqlens_q,
+                all_kv_indptr,
+                all_kv_indices,
                 max_extend_len,
-                layer.scaling,
-                logit_cap=self.logits_soft_cap,
-                sliding_window_size=sliding_window_size,
-                sinks=sinks,  # Pass through from model
-                window_kv_offsets=window_kv_offsets,
-                xai_temperature_len=layer.xai_temperature_len,
+                max_seqlen_k,
+                softmax_scale=layer.scaling,
+                logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                causal=True,
+                window_size=window_size,
+                seqlen_k=seqlen_k,
+                sink_ptr=sink_ptr,
             )
 
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DEBUG] extend_attention_fwd output: o_view min={o_view.min().item():.4f}, max={o_view.max().item():.4f}, mean={o_view.mean().item():.4f}\n")
-                    f.flush()
-
-            return o
+            return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -1634,26 +1629,33 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            # Compute dynamic scales for FP8 KV cache (decode adds one token at a time)
-            k_scale_val = None
-            v_scale_val = None
-            if self.kv_cache_dtype == fp8_dtype:
-                k_absmax = k.abs().max().item()
-                v_absmax = v.abs().max().item()
-
-                k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
-                v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
-
-                # Update running max scale for this layer
-                if layer.layer_id in self._fp8_kv_scales:
-                    old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
-                    k_scale_val = max(k_scale_val, old_k_scale)
-                    v_scale_val = max(v_scale_val, old_v_scale)
-                self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
-
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+            # Check if fused RoPE + KV cache write is available
+            _has_fused_rope = (
+                _has_fused_rope_cache
+                and hasattr(layer, '_fused_rope_cos')
+                and not self.use_mla
             )
+            if _has_fused_rope:
+                # Fused path: apply RoPE and write to cache in one kernel
+                self._apply_fused_rope_and_cache(
+                    q, k, v, layer, forward_batch, forward_batch.out_cache_loc
+                )
+            else:
+                # Original path (non-fused): use pre-computed per-layer scales
+                # for graph-safe FP8 KV cache write.
+                k_scale_val = None
+                v_scale_val = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    # Use scales computed during extend (stored in persistent tensors).
+                    # .item() is safe here only outside graph capture; during capture
+                    # the fused path above is taken instead.
+                    lid = layer.layer_id
+                    k_scale_val = self._fp8_k_scale_per_layer[lid].item()
+                    v_scale_val = self._fp8_v_scale_per_layer[lid].item()
+
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                )
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1735,32 +1737,22 @@ class AiterAttnBackend(AttentionBackend):
             # Native FP8 compute is supported - no need to convert to BF16
             if self.kv_cache_dtype == fp8_dtype:
                 kv_cache_dtype_str = "fp8"
-                # IMPORTANT: The kernel expects uint8_t data when kv_cache_dtype="fp8"
-                # The FP8 tensor must be viewed as uint8 for the kernel interface
-                # See csrc/cpp_itfs/pa/pa_ragged.py line 104: kv_dtype = "uint8_t"
+                # The kernel expects uint8_t data when kv_cache_dtype="fp8"
                 k_cache_view = k_cache.view(torch.uint8)
                 v_cache_view = v_cache.view(torch.uint8)
-
-                # Debug: Compare FP8 vs BF16 decode for first few calls
-                if not hasattr(self, '_decode_debug_count'):
-                    self._decode_debug_count = 0
-                do_decode_debug = layer.layer_id == 0 and self._decode_debug_count < 3
-                if do_decode_debug:
-                    self._decode_debug_count += 1
-                    logger.info(f"[FP8 Decode Debug] kv_indptr={kv_indptr[:5].tolist()}, kv_indices[:10]={kv_indices[:min(10, len(kv_indices))].tolist()}")
             else:
                 kv_cache_dtype_str = "auto"
                 k_cache_view = k_cache
                 v_cache_view = v_cache
 
-            # Get per-layer FP8 scales for proper dequantization
-            if kv_cache_dtype_str == "fp8" and layer.layer_id in self._fp8_kv_scales:
-                k_scale_val, v_scale_val = self._fp8_kv_scales[layer.layer_id]
-                # Update the pre-allocated tensors with actual scales
-                decode_k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device=self.device)
-                decode_v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device=self.device)
-                if layer.layer_id == 0 and do_decode_debug:
-                    logger.info(f"[FP8 Decode] Using scales: k_scale={k_scale_val:.4f}, v_scale={v_scale_val:.4f}")
+            # Get per-layer FP8 scales using pre-allocated persistent tensors
+            # (CUDA graph safe — no dict lookups, no tensor creation, no host syncs)
+            if kv_cache_dtype_str == "fp8":
+                lid = layer.layer_id
+                self._decode_k_scale_buf.copy_(self._fp8_k_scale_per_layer[lid:lid+1])
+                self._decode_v_scale_buf.copy_(self._fp8_v_scale_per_layer[lid:lid+1])
+                decode_k_scale = self._decode_k_scale_buf
+                decode_v_scale = self._decode_v_scale_buf
             else:
                 decode_k_scale = self.k_scale
                 decode_v_scale = self.v_scale
@@ -1775,12 +1767,6 @@ class AiterAttnBackend(AttentionBackend):
                     sink_ptr = sinks.to(torch.float32)
                 else:
                     sink_ptr = sinks
-
-            if layer.layer_id == 0:
-                with open("/tmp/aiter_debug.txt", "a") as f:
-                    f.write(f"[AITER DECODE] q shape={q.shape}, kv_indptr={kv_indptr[:5].tolist()}, kv_indices[:10]={kv_indices[:min(10, len(kv_indices))].tolist()}\n")
-                    f.write(f"[AITER DECODE] k_cache dtype={k_cache.dtype}, sliding_window={layer.sliding_window_size}, has_sinks={sink_ptr is not None}\n")
-                    f.flush()
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
