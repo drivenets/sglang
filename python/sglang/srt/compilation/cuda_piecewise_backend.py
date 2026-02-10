@@ -148,6 +148,13 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
+            # Check if PCG capture stream is available. If not (e.g., runtime
+            # recompilation from mixed-chunk batches with unseen metadata),
+            # fall back to eager execution instead of crashing.
+            stream = get_pcg_capture_stream()
+            if stream is None:
+                return entry.runnable(*args)
+
             if self.compile_config.get_enable_debug_mode():
                 input_addresses = [
                     x.data_ptr() for x in args if isinstance(x, torch.Tensor)
@@ -165,11 +172,6 @@ class CUDAPiecewiseBackend:
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
-                # mind-exploding: carefully manage the reference and memory.
-                stream = get_pcg_capture_stream()
-                assert (
-                    stream is not None
-                ), "PCG capture stream is not set, please check if runtime recompilation happened"
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
