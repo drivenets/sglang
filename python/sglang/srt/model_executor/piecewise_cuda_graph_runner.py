@@ -28,6 +28,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
+    enable_piecewise_capture,
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
     set_forward_context,
@@ -239,7 +240,7 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with enable_piecewise_cuda_graph():
+        with enable_piecewise_cuda_graph(), enable_piecewise_capture():
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )

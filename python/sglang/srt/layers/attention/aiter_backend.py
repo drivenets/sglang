@@ -54,6 +54,7 @@ try:
 except ImportError:
     _has_fused_rope_cache = False
 
+from sglang.srt.compilation.piecewise_context_manager import is_piecewise_capture_active
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
@@ -1175,8 +1176,22 @@ class AiterAttnBackend(AttentionBackend):
 
         This replaces separate RoPE application (in model) + set_kv_buffer (here)
         with a single fused kernel call that does both in one pass.
+
+        During piecewise CUDA graph warmup/capture (dummy inputs), falls back
+        to a pure-torch RoPE + set_kv_buffer to avoid the fused Triton kernel
+        crash (HIP illegal memory access with zero-valued slot_mapping).
         """
         num_tokens = k.shape[0]
+
+        # During piecewise capture, the fused Triton kernel crashes with
+        # dummy inputs (HIP illegal memory access with zero-valued
+        # slot_mapping).  Fall back to plain set_kv_buffer — RoPE values
+        # don't matter during warmup/capture (outputs are throwaway).
+        if is_piecewise_capture_active():
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v,
+            )
+            return
 
         # Reshape q to 3D: (T, QH, D) for the fused kernel
         q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)

@@ -9,6 +9,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
 _pcg_capture_stream = None
+_piecewise_capture_active = False
 
 
 def is_in_piecewise_cuda_graph():
@@ -17,6 +18,12 @@ def is_in_piecewise_cuda_graph():
 
 def is_in_pcg_torch_compile():
     return _in_pcg_torch_compile
+
+
+def is_piecewise_capture_active():
+    """True during piecewise CUDA graph warmup + capture (dummy inputs).
+    False during replay (real inputs) and normal execution."""
+    return _piecewise_capture_active
 
 
 def get_pcg_capture_stream():
@@ -47,6 +54,19 @@ def set_pcg_capture_stream(stream: torch.cuda.Stream):
     _pcg_capture_stream = stream
     yield
     _pcg_capture_stream = None
+
+
+@contextmanager
+def enable_piecewise_capture():
+    """Mark that we are in the piecewise warmup + capture phase (dummy inputs).
+    Custom kernels that crash with dummy inputs should check
+    is_piecewise_capture_active() and fall back to safe implementations."""
+    global _piecewise_capture_active
+    _piecewise_capture_active = True
+    try:
+        yield
+    finally:
+        _piecewise_capture_active = False
 
 
 @dataclass
