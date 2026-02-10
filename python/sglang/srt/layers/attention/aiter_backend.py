@@ -211,10 +211,22 @@ class AiterAttnBackend(AttentionBackend):
         self.v_scale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
         self.q_descale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
 
-        # Per-layer FP8 KV scales for dynamic scaling
-        # Stores running max of K/V values to compute proper FP8 scales
-        self._fp8_kv_scales = {}  # Dict[layer_id, Tuple[k_scale, v_scale]]
+        # Per-layer FP8 KV scales — pre-allocated GPU tensors for CUDA graph safety.
+        # Updated during extend (non-graph) via .copy_(), reused during decode (graph).
+        num_layers = model_runner.model_config.num_hidden_layers
+        self._fp8_k_scale_per_layer = torch.ones(
+            num_layers, dtype=torch.float32, device=self.device
+        )
+        self._fp8_v_scale_per_layer = torch.ones(
+            num_layers, dtype=torch.float32, device=self.device
+        )
+        # Persistent 1-element buffers for decode attention (never re-allocated)
+        self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._fp8_safe_max = 400.0  # Safe max for FP8 E4M3 (actual max is 448)
+        self._fp8_safe_max_t = torch.tensor(
+            [self._fp8_safe_max], dtype=torch.float32, device=self.device
+        )
 
         self.logits_soft_cap = 0.0
 
@@ -1249,23 +1261,26 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     # Original path: separate RoPE (already applied) + set_kv_buffer
-                    # Compute dynamic scales for FP8 KV cache
                     k_scale_val = None
                     v_scale_val = None
                     if self.kv_cache_dtype == fp8_dtype:
-                        k_absmax = k.abs().max().item()
-                        v_absmax = v.abs().max().item()
+                        # Compute dynamic scales on GPU, store in per-layer tensors
+                        k_absmax = k.abs().amax()
+                        v_absmax = v.abs().amax()
+                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
+                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                        # Update running max (extend is not graph-captured)
+                        lid = layer.layer_id
+                        self._fp8_k_scale_per_layer[lid] = torch.maximum(
+                            self._fp8_k_scale_per_layer[lid], k_scale
+                        )
+                        self._fp8_v_scale_per_layer[lid] = torch.maximum(
+                            self._fp8_v_scale_per_layer[lid], v_scale
+                        )
+                        # .item() OK here — extend path is never graph-captured
+                        k_scale_val = self._fp8_k_scale_per_layer[lid].item()
+                        v_scale_val = self._fp8_v_scale_per_layer[lid].item()
 
-                        k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
-                        v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
-
-                        if layer.layer_id in self._fp8_kv_scales:
-                            old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
-                            k_scale_val = max(k_scale_val, old_k_scale)
-                            v_scale_val = max(v_scale_val, old_v_scale)
-                        self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
-
-                    # Pass scales to set_kv_buffer for proper FP8 quantization
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
                     )
@@ -1521,108 +1536,6 @@ class AiterAttnBackend(AttentionBackend):
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             
             
-            # For FP8 KV-cache, try native FP8 for no-prefix case
-            if self.kv_cache_dtype == fp8_dtype:
-                if extend_no_prefix:
-                    # Native FP8 path - no prefix, just new tokens
-                    cu_seqlens_local = torch.zeros(bs0, dtype=torch.int32, device=q.device)
-                    cu_seqlens_local[1:bs0] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-                    max_seqlen = max(forward_batch.extend_seq_lens_cpu)
-                    
-                    # Reshape for attention
-                    q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                    k_view = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-                    v_view = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                    
-                    # Dynamic scaling for FP8 conversion
-                    # FP8 E4M3 max is 448, use 400 as safe max to avoid edge cases
-                    fp8_safe_max = 400.0
-                    
-                    q_max = q_view.abs().max().item()
-                    k_max = k_view.abs().max().item()
-                    v_max = v_view.abs().max().item()
-                    
-                    # Compute scales (only scale if needed)
-                    q_scale = max(q_max / fp8_safe_max, 1.0)
-                    k_scale_val = max(k_max / fp8_safe_max, 1.0)
-                    v_scale_val = max(v_max / fp8_safe_max, 1.0)
-                    
-                    # Scale tensors before FP8 conversion
-                    if q_scale > 1.0:
-                        q_view = q_view / q_scale
-                    if k_scale_val > 1.0:
-                        k_view = k_view / k_scale_val
-                    if v_scale_val > 1.0:
-                        v_view = v_view / v_scale_val
-                    
-                    # Convert to FP8
-                    q_fp8 = q_view.to(fp8_dtype)
-                    k_fp8 = k_view.to(fp8_dtype)
-                    v_fp8 = v_view.to(fp8_dtype)
-                    
-                    # Create descale tensors for the kernel
-                    # descale values are MULTIPLIERS to dequantize FP8 values
-                    # If we scaled down by X before FP8 conversion, we need descale=X to scale back up
-                    # Note: q_descale and k_descale affect attention scores, v_descale affects output
-                    q_descale_dyn = torch.tensor([q_scale], dtype=torch.float32, device=q.device)
-                    k_descale_dyn = torch.tensor([k_scale_val], dtype=torch.float32, device=q.device)
-                    v_descale_dyn = torch.tensor([v_scale_val], dtype=torch.float32, device=q.device)
-                    
-                    o_fp8 = flash_attn_varlen_fp8_pertensor_func(
-                        q_fp8,
-                        k_fp8,
-                        v_fp8,
-                        q_descale_dyn,
-                        k_descale_dyn,
-                        v_descale_dyn,
-                        cu_seqlens_local,
-                        cu_seqlens_local,
-                        max_seqlen,
-                        max_seqlen,
-                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
-                        causal=True,
-                        softmax_scale=layer.scaling,
-                    )
-                    
-                    # Debug: Compare with BF16 reference for layer 0
-                    # Skip when max_seqlen=1 as BF16 kernel doesn't support it
-                    if layer.layer_id == 0 and not hasattr(self, '_fp8_debug_count'):
-                        self._fp8_debug_count = 0
-                    if layer.layer_id == 0 and self._fp8_debug_count < 3 and max_seqlen > 1:
-                        self._fp8_debug_count += 1
-                        # Run BF16 reference
-                        try:
-                            o_bf16 = flash_attn_varlen_func(
-                                q_view, k_view, v_view,
-                                cu_seqlens_local, cu_seqlens_local,
-                                max_seqlen, max_seqlen,
-                                softmax_scale=layer.scaling,
-                                causal=True,
-                            )
-                            cos_sim = torch.nn.functional.cosine_similarity(
-                                o_fp8.flatten().unsqueeze(0).float(),
-                                o_bf16.flatten().unsqueeze(0).float()
-                            ).item()
-                            logger.info(f"[FP8 Debug] Layer 0: FP8 vs BF16 cos_sim={cos_sim:.6f}, o_fp8 range=[{o_fp8.min():.4f}, {o_fp8.max():.4f}]")
-                        except Exception as e:
-                            logger.warning(f"[FP8 Debug] BF16 comparison failed: {e}")
-                    
-                    if layer.layer_id == 0:
-                        logger.info(f"[AITER DEBUG] FP8 no-prefix path output: o_fp8 min={o_fp8.min().item():.4f}, max={o_fp8.max().item():.4f}, mean={o_fp8.mean().item():.4f}")
-                    return o_fp8.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-                # Has prefix - fall through to BF16 mha_batch_prefill_func path
-                # Convert FP8 cache to BF16 for AITER batch prefill kernel
-                if layer.layer_id == 0:
-                    logger.info(f"[AITER] FP8 extend-with-prefix: converting cache to BF16 for mha_batch_prefill")
-                k_cache = k_cache.to(torch.bfloat16)
-                v_cache = v_cache.to(torch.bfloat16)
-
-            # BF16 path: Use AITER mha_batch_prefill_func with all tokens in cache
-            # Since set_kv_buffer was called above, both prefix and extend tokens
-            # are already in the KV cache. We use seqlen_k to tell the kernel the
-            # total KV length for proper bottom-right aligned causal masking.
-
             # cu_seqlens_q: cumulative Q lengths (extend tokens only)
             cu_seqlens_q = self.qo_indptr
             cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -1661,13 +1574,19 @@ class AiterAttnBackend(AttentionBackend):
                 sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
 
             # Compute window_size tuple for mha_batch_prefill_func
-            # window_size = (window_left, window_right)
             if sliding_window_size > 0:
                 window_size = (sliding_window_size, 0)
             else:
                 window_size = (-1, -1)
 
             q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+            # FP8 KV cache: convert to BF16 for mha_batch_prefill_func
+            # (kernel requires Q/K same dtype; decode uses paged_attention_ragged
+            # which supports FP8 natively and avoids this conversion)
+            if self.kv_cache_dtype == fp8_dtype:
+                k_cache = k_cache.to(torch.bfloat16)
+                v_cache = v_cache.to(torch.bfloat16)
 
             o_aiter = mha_batch_prefill_func(
                 q_view,
@@ -1722,21 +1641,17 @@ class AiterAttnBackend(AttentionBackend):
                     q, k, v, layer, forward_batch, forward_batch.out_cache_loc
                 )
             else:
-                # Original path: separate RoPE (already applied) + set_kv_buffer
+                # Original path (non-fused): use pre-computed per-layer scales
+                # for graph-safe FP8 KV cache write.
                 k_scale_val = None
                 v_scale_val = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    k_absmax = k.abs().max().item()
-                    v_absmax = v.abs().max().item()
-
-                    k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
-                    v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
-
-                    if layer.layer_id in self._fp8_kv_scales:
-                        old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
-                        k_scale_val = max(k_scale_val, old_k_scale)
-                        v_scale_val = max(v_scale_val, old_v_scale)
-                    self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
+                    # Use scales computed during extend (stored in persistent tensors).
+                    # .item() is safe here only outside graph capture; during capture
+                    # the fused path above is taken instead.
+                    lid = layer.layer_id
+                    k_scale_val = self._fp8_k_scale_per_layer[lid].item()
+                    v_scale_val = self._fp8_v_scale_per_layer[lid].item()
 
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
@@ -1822,32 +1737,22 @@ class AiterAttnBackend(AttentionBackend):
             # Native FP8 compute is supported - no need to convert to BF16
             if self.kv_cache_dtype == fp8_dtype:
                 kv_cache_dtype_str = "fp8"
-                # IMPORTANT: The kernel expects uint8_t data when kv_cache_dtype="fp8"
-                # The FP8 tensor must be viewed as uint8 for the kernel interface
-                # See csrc/cpp_itfs/pa/pa_ragged.py line 104: kv_dtype = "uint8_t"
+                # The kernel expects uint8_t data when kv_cache_dtype="fp8"
                 k_cache_view = k_cache.view(torch.uint8)
                 v_cache_view = v_cache.view(torch.uint8)
-
-                # Debug: Compare FP8 vs BF16 decode for first few calls
-                if not hasattr(self, '_decode_debug_count'):
-                    self._decode_debug_count = 0
-                do_decode_debug = layer.layer_id == 0 and self._decode_debug_count < 3
-                if do_decode_debug:
-                    self._decode_debug_count += 1
-                    logger.info(f"[FP8 Decode Debug] kv_indptr={kv_indptr[:5].tolist()}, kv_indices[:10]={kv_indices[:min(10, len(kv_indices))].tolist()}")
             else:
                 kv_cache_dtype_str = "auto"
                 k_cache_view = k_cache
                 v_cache_view = v_cache
 
-            # Get per-layer FP8 scales for proper dequantization
-            if kv_cache_dtype_str == "fp8" and layer.layer_id in self._fp8_kv_scales:
-                k_scale_val, v_scale_val = self._fp8_kv_scales[layer.layer_id]
-                # Update the pre-allocated tensors with actual scales
-                decode_k_scale = torch.tensor([k_scale_val], dtype=torch.float32, device=self.device)
-                decode_v_scale = torch.tensor([v_scale_val], dtype=torch.float32, device=self.device)
-                if layer.layer_id == 0 and do_decode_debug:
-                    logger.info(f"[FP8 Decode] Using scales: k_scale={k_scale_val:.4f}, v_scale={v_scale_val:.4f}")
+            # Get per-layer FP8 scales using pre-allocated persistent tensors
+            # (CUDA graph safe — no dict lookups, no tensor creation, no host syncs)
+            if kv_cache_dtype_str == "fp8":
+                lid = layer.layer_id
+                self._decode_k_scale_buf.copy_(self._fp8_k_scale_per_layer[lid:lid+1])
+                self._decode_v_scale_buf.copy_(self._fp8_v_scale_per_layer[lid:lid+1])
+                decode_k_scale = self._decode_k_scale_buf
+                decode_v_scale = self._decode_v_scale_buf
             else:
                 decode_k_scale = self.k_scale
                 decode_v_scale = self.v_scale
