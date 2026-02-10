@@ -75,7 +75,20 @@ from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_hip = not _is_cuda and not _is_npu
 
+from sglang.srt.utils import get_bool_env_var
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_fused_rope_cache = _use_aiter  # Fused RoPE + KV cache write
+
+if _use_fused_rope_cache:
+    try:
+        from aiter.ops.triton.fusions.fused_kv_cache import (
+            fused_qk_rope_reshape_and_cache,
+        )
+    except ImportError:
+        _use_fused_rope_cache = False
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
@@ -307,20 +320,32 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        extra_args = {}
-        if not _is_npu:
-            extra_args = {
-                "fused_set_kv_buffer_arg": (
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    else None
-                ),
-            }
-        q, k = self.rotary_emb(positions, q, k, **extra_args)
+        if _use_fused_rope_cache:
+            # Defer RoPE to the attention backend: store RoPE info on the
+            # attention layer so aiter_backend can use the fused
+            # fused_qk_rope_reshape_and_cache kernel.
+            rope = self.rotary_emb
+            self.attn._fused_rope_cos = rope.cos_cache
+            self.attn._fused_rope_sin = rope.sin_cache
+            self.attn._fused_rope_is_neox = rope.is_neox_style
+            self.attn._fused_rope_positions = positions
+            # Don't apply RoPE here -- the backend will do it fused with KV cache write
+        else:
+            extra_args = {}
+            if not _is_npu:
+                extra_args = {
+                    "fused_set_kv_buffer_arg": (
+                        create_fused_set_kv_buffer_arg(
+                            value=v,
+                            layer=self.attn,
+                            forward_batch=forward_batch,
+                        )
+                        if enable_fused_set_kv_buffer(forward_batch)
+                        else None
+                    ),
+                }
+            q, k = self.rotary_emb(positions, q, k, **extra_args)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 

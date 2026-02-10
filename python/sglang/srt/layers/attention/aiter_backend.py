@@ -46,6 +46,14 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+try:
+    from aiter.ops.triton.fusions.fused_kv_cache import (
+        fused_qk_rope_reshape_and_cache,
+    )
+    _has_fused_rope_cache = True
+except ImportError:
+    _has_fused_rope_cache = False
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
@@ -1142,6 +1150,68 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _apply_fused_rope_and_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+    ):
+        """Apply fused RoPE + KV cache write using aiter kernel.
+
+        This replaces separate RoPE application (in model) + set_kv_buffer (here)
+        with a single fused kernel call that does both in one pass.
+        """
+        num_tokens = k.shape[0]
+
+        # Reshape q to 3D: (T, QH, D) for the fused kernel
+        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        # k and v are already 3D from RadixAttention.forward: (T, KH, D)
+
+        # Get cos/sin from the stored RoPE info
+        cos_cache = layer._fused_rope_cos   # (max_pos, 1, 1, D//2)
+        sin_cache = layer._fused_rope_sin   # (max_pos, 1, 1, D//2)
+        is_neox = layer._fused_rope_is_neox
+        positions = layer._fused_rope_positions[:num_tokens]
+
+        # Get KV cache buffers and reshape for flash_layout (block_size=1)
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # View as FP8 if KV cache is FP8
+        if self.kv_cache_dtype == fp8_dtype:
+            k_cache = k_cache.view(self.kv_cache_dtype)
+            v_cache = v_cache.view(self.kv_cache_dtype)
+
+        # Reshape from (pool_size, KH, D) to (pool_size, 1, KH, D) for block_size=1
+        k_cache_4d = k_cache.unsqueeze(1)
+        v_cache_4d = v_cache.unsqueeze(1)
+
+        # Apply fused kernel: RoPE on q,k + write k,v to cache
+        # q_3d and k are views of the original tensors so in-place update
+        # propagates back to the caller.
+        fused_qk_rope_reshape_and_cache(
+            q_3d,                   # (T, QH, D) -- RoPE applied in-place via q_out
+            k,                      # (T, KH, D) -- RoPE applied in-place via k_out
+            v,                      # (T, KH, D) -- written to cache
+            k_cache_4d,             # (pool_size, 1, KH, D)
+            v_cache_4d,             # (pool_size, 1, KH, D)
+            cache_loc,              # (T,) slot mapping
+            positions,              # (T,) token positions
+            cos_cache,              # (max_pos, 1, 1, D//2)
+            sin_cache,              # (max_pos, 1, 1, D//2)
+            self.k_scale,           # k_scale
+            self.v_scale,           # v_scale
+            is_neox,
+            flash_layout=True,
+            apply_scale=(self.kv_cache_dtype == fp8_dtype),
+            q_out=q_3d,            # in-place (same storage as q)
+            k_out=k,               # in-place
+            output_zeros=False,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1166,34 +1236,39 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                # Compute dynamic scales for FP8 KV cache
-                k_scale_val = None
-                v_scale_val = None
-                if self.kv_cache_dtype == fp8_dtype:
-                    k_absmax = k.abs().max().item()
-                    v_absmax = v.abs().max().item()
-
-                    # Compute scale if values exceed FP8 safe range
-                    # scale = max_val / fp8_safe_max, values stored as: val / scale
-                    # During decode: val * scale to restore
-                    k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
-                    v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
-
-                    # Update running max scale for this layer
-                    if layer.layer_id in self._fp8_kv_scales:
-                        old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
-                        k_scale_val = max(k_scale_val, old_k_scale)
-                        v_scale_val = max(v_scale_val, old_v_scale)
-                    self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
-
-                    # Debug logging disabled for performance
-                    # if layer.layer_id == 0:
-                    #     logger.info(f"[FP8 Scale] Layer {layer.layer_id}: K |max|={k_absmax:.1f}, V |max|={v_absmax:.1f}, k_scale={k_scale_val:.4f}, v_scale={v_scale_val:.4f}")
-
-                # Pass scales to set_kv_buffer for proper FP8 quantization
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                # Check if fused RoPE + KV cache write is available
+                _has_fused_rope = (
+                    _has_fused_rope_cache
+                    and hasattr(layer, '_fused_rope_cos')
+                    and not self.use_mla
                 )
+                if _has_fused_rope:
+                    # Fused path: apply RoPE and write to cache in one kernel
+                    self._apply_fused_rope_and_cache(
+                        q, k, v, layer, forward_batch, cache_loc
+                    )
+                else:
+                    # Original path: separate RoPE (already applied) + set_kv_buffer
+                    # Compute dynamic scales for FP8 KV cache
+                    k_scale_val = None
+                    v_scale_val = None
+                    if self.kv_cache_dtype == fp8_dtype:
+                        k_absmax = k.abs().max().item()
+                        v_absmax = v.abs().max().item()
+
+                        k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
+                        v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
+
+                        if layer.layer_id in self._fp8_kv_scales:
+                            old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
+                            k_scale_val = max(k_scale_val, old_k_scale)
+                            v_scale_val = max(v_scale_val, old_v_scale)
+                        self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
+
+                    # Pass scales to set_kv_buffer for proper FP8 quantization
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                    )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -1635,26 +1710,37 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-            # Compute dynamic scales for FP8 KV cache (decode adds one token at a time)
-            k_scale_val = None
-            v_scale_val = None
-            if self.kv_cache_dtype == fp8_dtype:
-                k_absmax = k.abs().max().item()
-                v_absmax = v.abs().max().item()
-
-                k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
-                v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
-
-                # Update running max scale for this layer
-                if layer.layer_id in self._fp8_kv_scales:
-                    old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
-                    k_scale_val = max(k_scale_val, old_k_scale)
-                    v_scale_val = max(v_scale_val, old_v_scale)
-                self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
-
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+            # Check if fused RoPE + KV cache write is available
+            _has_fused_rope = (
+                _has_fused_rope_cache
+                and hasattr(layer, '_fused_rope_cos')
+                and not self.use_mla
             )
+            if _has_fused_rope:
+                # Fused path: apply RoPE and write to cache in one kernel
+                self._apply_fused_rope_and_cache(
+                    q, k, v, layer, forward_batch, forward_batch.out_cache_loc
+                )
+            else:
+                # Original path: separate RoPE (already applied) + set_kv_buffer
+                k_scale_val = None
+                v_scale_val = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    k_absmax = k.abs().max().item()
+                    v_absmax = v.abs().max().item()
+
+                    k_scale_val = max(k_absmax / self._fp8_safe_max, 1.0)
+                    v_scale_val = max(v_absmax / self._fp8_safe_max, 1.0)
+
+                    if layer.layer_id in self._fp8_kv_scales:
+                        old_k_scale, old_v_scale = self._fp8_kv_scales[layer.layer_id]
+                        k_scale_val = max(k_scale_val, old_k_scale)
+                        v_scale_val = max(v_scale_val, old_v_scale)
+                    self._fp8_kv_scales[layer.layer_id] = (k_scale_val, v_scale_val)
+
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                )
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
