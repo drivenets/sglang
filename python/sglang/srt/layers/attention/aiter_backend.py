@@ -2479,9 +2479,15 @@ class AiterAttnBackend(AttentionBackend):
             # Check if we have prefix tokens to attend to
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
-            # FP8 fast path: for no-prefix extends, use fresh BF16 Q/K/V
-            # directly. This avoids reading from the FP8 cache entirely.
-            if extend_no_prefix and self.kv_cache_dtype == fp8_dtype:
+            # Determine sliding window settings
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                sliding_window_size = layer.sliding_window_size
+            else:
+                sliding_window_size = -1
+
+            # Fast path: for no-prefix extends (pure prefills), use fresh
+            # BF16 Q/K/V directly with flash_attn_varlen_func.
+            if extend_no_prefix:
                 cu_seqlens = self.qo_indptr
                 cu_seqlens[1 : forward_batch.batch_size + 1] = torch.cumsum(
                     forward_batch.extend_seq_lens, dim=0
@@ -2493,6 +2499,7 @@ class AiterAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 )
 
+                # k, v are already 3D (T, KH, D) in BF16 with RoPE applied.
                 o = flash_attn_varlen_func(
                     q_view,
                     k,
@@ -2504,9 +2511,11 @@ class AiterAttnBackend(AttentionBackend):
                     min_seqlen_q=1,
                     softmax_scale=layer.scaling,
                     causal=True,
+                    window_size=(sliding_window_size, 0, 0) if sliding_window_size > 0 else (-1, -1, 0),
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            # Fallback: read from KV cache via mha_batch_prefill_func
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 q = q.to(fp8_dtype)
