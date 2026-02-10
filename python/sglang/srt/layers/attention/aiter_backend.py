@@ -48,6 +48,14 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+try:
+    from aiter.ops.triton.fusions.fused_kv_cache import (
+        fused_qk_rope_reshape_and_cache,
+    )
+    _has_fused_rope_cache = True
+except ImportError:
+    _has_fused_rope_cache = False
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import (
     launch_reshape_and_cache_flash,
@@ -2017,6 +2025,68 @@ class AiterAttnBackend(AttentionBackend):
         # This override prevents overlap-plan stream mode from failing with the
         # base class NotImplementedError.
         pass
+
+    def _apply_fused_rope_and_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cache_loc: torch.Tensor,
+    ):
+        """Apply fused RoPE + KV cache write using aiter kernel.
+
+        This replaces separate RoPE application (in model) + set_kv_buffer (here)
+        with a single fused kernel call that does both in one pass.
+        """
+        num_tokens = k.shape[0]
+
+        # Reshape q to 3D: (T, QH, D) for the fused kernel
+        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        # k and v are already 3D from RadixAttention.forward: (T, KH, D)
+
+        # Get cos/sin from the stored RoPE info
+        cos_cache = layer._fused_rope_cos   # (max_pos, 1, 1, D//2)
+        sin_cache = layer._fused_rope_sin   # (max_pos, 1, 1, D//2)
+        is_neox = layer._fused_rope_is_neox
+        positions = layer._fused_rope_positions[:num_tokens]
+
+        # Get KV cache buffers and reshape for flash_layout (block_size=1)
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        # View as FP8 if KV cache is FP8
+        if self.kv_cache_dtype == fp8_dtype:
+            k_cache = k_cache.view(self.kv_cache_dtype)
+            v_cache = v_cache.view(self.kv_cache_dtype)
+
+        # Reshape from (pool_size, KH, D) to (pool_size, 1, KH, D) for block_size=1
+        k_cache_4d = k_cache.unsqueeze(1)
+        v_cache_4d = v_cache.unsqueeze(1)
+
+        # Apply fused kernel: RoPE on q,k + write k,v to cache
+        # q_3d and k are views of the original tensors so in-place update
+        # propagates back to the caller.
+        fused_qk_rope_reshape_and_cache(
+            q_3d,                   # (T, QH, D) -- RoPE applied in-place via q_out
+            k,                      # (T, KH, D) -- RoPE applied in-place via k_out
+            v,                      # (T, KH, D) -- written to cache
+            k_cache_4d,             # (pool_size, 1, KH, D)
+            v_cache_4d,             # (pool_size, 1, KH, D)
+            cache_loc,              # (T,) slot mapping
+            positions,              # (T,) token positions
+            cos_cache,              # (max_pos, 1, 1, D//2)
+            sin_cache,              # (max_pos, 1, 1, D//2)
+            self.k_scale,           # k_scale
+            self.v_scale,           # v_scale
+            is_neox,
+            flash_layout=True,
+            apply_scale=(self.kv_cache_dtype == fp8_dtype),
+            q_out=q_3d,            # in-place (same storage as q)
+            k_out=k,               # in-place
+            output_zeros=False,
+        )
 
     def forward_extend(
         self,
