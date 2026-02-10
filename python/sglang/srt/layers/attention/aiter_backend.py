@@ -1541,11 +1541,15 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 sliding_window_size = -1
 
-            # FP8 fast path: for no-prefix extends, use fresh BF16 Q/K/V
-            # directly (like vLLM's pure prefill path). This avoids reading
-            # from the FP8 cache entirely — the KV cache was already written
-            # above, and Q/K have RoPE applied in-place by the fused kernel.
-            if extend_no_prefix and self.kv_cache_dtype == fp8_dtype:
+            # Fast path: for no-prefix extends (pure prefills), use fresh
+            # BF16 Q/K/V directly with flash_attn_varlen_func. This avoids
+            # reading from the KV cache entirely — the cache was already
+            # written above, and Q/K have RoPE applied in-place by the fused
+            # kernel. Benefits:
+            # 1. No req_to_token lookup (fixes piecewise CUDA graph capture)
+            # 2. No FP8→BF16 cache conversion overhead
+            # 3. Skips mha_batch_prefill_func indirection
+            if extend_no_prefix:
                 cu_seqlens = self.qo_indptr
                 cu_seqlens[1 : bs + 1] = torch.cumsum(
                     forward_batch.extend_seq_lens, dim=0
@@ -1558,7 +1562,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 # k, v are already 3D (T, KH, D) in BF16 with RoPE applied.
-                # Self-attention on fresh tokens — no FP8 cache read needed.
+                # Self-attention on fresh tokens — no cache read needed.
                 o = flash_attn_varlen_func(
                     q_view,
                     k,
@@ -1570,11 +1574,12 @@ class AiterAttnBackend(AttentionBackend):
                     min_seqlen_q=1,
                     softmax_scale=layer.scaling,
                     causal=True,
+                    window_size=(sliding_window_size, 0, 0) if sliding_window_size > 0 else (-1, -1, 0),
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             # Fallback: read from KV cache via mha_batch_prefill_func
-            # (used for BF16 cache or extends with prefix)
+            # (used for extends with prefix tokens that need cache reads)
             cu_seqlens_q = self.qo_indptr
             cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             cu_seqlens_q = cu_seqlens_q[:bs0]
