@@ -2476,6 +2476,37 @@ class AiterAttnBackend(AttentionBackend):
             # declare the necessary parameter and assign None as default value
             q_descale = None
 
+            # Check if we have prefix tokens to attend to
+            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+
+            # FP8 fast path: for no-prefix extends, use fresh BF16 Q/K/V
+            # directly. This avoids reading from the FP8 cache entirely.
+            if extend_no_prefix and self.kv_cache_dtype == fp8_dtype:
+                cu_seqlens = self.qo_indptr
+                cu_seqlens[1 : forward_batch.batch_size + 1] = torch.cumsum(
+                    forward_batch.extend_seq_lens, dim=0
+                )
+                cu_seqlens = cu_seqlens[:bs0]
+                max_len = max(forward_batch.extend_seq_lens_cpu)
+
+                q_view = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                )
+
+                o = flash_attn_varlen_func(
+                    q_view,
+                    k,
+                    v,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_len,
+                    max_len,
+                    min_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 q = q.to(fp8_dtype)
