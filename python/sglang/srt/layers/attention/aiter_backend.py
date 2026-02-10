@@ -1766,28 +1766,20 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices = self.forward_metadata.kv_indices
 
             # Determine kv_cache_dtype string for paged_attention_ragged
-            # Native FP8 compute is supported - no need to convert to BF16
             if self.kv_cache_dtype == fp8_dtype:
                 kv_cache_dtype_str = "fp8"
-                # The kernel expects uint8_t data when kv_cache_dtype="fp8"
-                k_cache_view = k_cache.view(torch.uint8)
-                v_cache_view = v_cache.view(torch.uint8)
+                k_cache_view = k_cache.view(self.kv_cache_dtype)
+                v_cache_view = v_cache.view(self.kv_cache_dtype)
             else:
                 kv_cache_dtype_str = "auto"
                 k_cache_view = k_cache
                 v_cache_view = v_cache
 
-            # Get per-layer FP8 scales using pre-allocated persistent tensors
-            # (CUDA graph safe — no dict lookups, no tensor creation, no host syncs)
-            if kv_cache_dtype_str == "fp8":
-                lid = layer.layer_id
-                self._decode_k_scale_buf.copy_(self._fp8_k_scale_per_layer[lid:lid+1])
-                self._decode_v_scale_buf.copy_(self._fp8_v_scale_per_layer[lid:lid+1])
-                decode_k_scale = self._decode_k_scale_buf
-                decode_v_scale = self._decode_v_scale_buf
-            else:
-                decode_k_scale = self.k_scale
-                decode_v_scale = self.v_scale
+            # FP8 decode scales: the fused RoPE+cache kernel writes with
+            # self.k_scale / self.v_scale (default 1.0), so use them directly.
+            # No per-layer copy needed — same scale for all layers.
+            decode_k_scale = self.k_scale
+            decode_v_scale = self.v_scale
 
             # Get sinks from kwargs (passed from model for attention sink support)
             sinks = kwargs.get("sinks", None)
