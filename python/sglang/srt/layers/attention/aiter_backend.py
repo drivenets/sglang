@@ -1556,6 +1556,12 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 sliding_window_size = -1
 
+            # Extract attention sinks (GPT-OSS uses learned per-head sink params)
+            sinks = kwargs.get("sinks", None)
+            sink_ptr = None
+            if sinks is not None:
+                sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
             # Fast path: for no-prefix extends (pure prefills), use fresh
             # BF16 Q/K/V directly with flash_attn_varlen_func. This avoids
             # reading from the KV cache entirely — the cache was already
@@ -1590,6 +1596,7 @@ class AiterAttnBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                     causal=True,
                     window_size=(sliding_window_size, 0, 0) if sliding_window_size > 0 else (-1, -1, 0),
+                    sink_ptr=sink_ptr,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -1622,11 +1629,6 @@ class AiterAttnBackend(AttentionBackend):
 
             seqlen_k = forward_batch.seq_lens[:bs].to(torch.int32)
             max_seqlen_k = max(forward_batch.seq_lens_cpu)
-
-            sinks = kwargs.get("sinks", None)
-            sink_ptr = None
-            if sinks is not None:
-                sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
 
             if sliding_window_size > 0:
                 window_size = (sliding_window_size, 0)
