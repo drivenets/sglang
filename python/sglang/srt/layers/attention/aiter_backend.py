@@ -221,6 +221,8 @@ class AiterAttnBackend(AttentionBackend):
         self._fp8_v_scale_per_layer = torch.ones(
             num_layers, dtype=torch.float32, device=self.device
         )
+        # Track which layers have been calibrated (first-extend scale computation)
+        self._fp8_scales_calibrated = [False] * num_layers
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
@@ -1171,6 +1173,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         cache_loc: torch.Tensor,
+        is_extend: bool = False,
     ):
         """Apply fused RoPE + KV cache write using aiter kernel.
 
@@ -1216,6 +1219,36 @@ class AiterAttnBackend(AttentionBackend):
         k_cache_4d = k_cache.unsqueeze(1)
         v_cache_4d = v_cache.unsqueeze(1)
 
+        # Determine FP8 scaling for KV cache write.
+        # For FP8, we need proper dynamic scales to avoid saturation/precision loss.
+        # Strategy: calibrate per-layer scales during the FIRST extend call for each
+        # layer, then freeze them.  This gives correct scales with zero overhead on
+        # subsequent extends and all decode steps.
+        if self.kv_cache_dtype == fp8_dtype:
+            lid = layer.layer_id
+            if is_extend and not self._fp8_scales_calibrated[lid]:
+                # First extend for this layer: compute scale from data.
+                # RoPE is a rotation so magnitudes are preserved; pre-RoPE
+                # absmax is a valid proxy for post-RoPE values.
+                k_absmax = k.abs().amax()
+                v_absmax = v.abs().amax()
+                k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
+                v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                self._fp8_k_scale_per_layer[lid] = k_scale_new
+                self._fp8_v_scale_per_layer[lid] = v_scale_new
+                self._fp8_scales_calibrated[lid] = True
+                if lid == 0:
+                    logger.info(
+                        f"FP8 KV cache: calibrated layer {lid} "
+                        f"k_scale={k_scale_new.item():.4f} v_scale={v_scale_new.item():.4f}"
+                    )
+            # Use the (frozen) per-layer scale — a view into the persistent tensor.
+            fused_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
+            fused_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
+        else:
+            fused_k_scale = self.k_scale
+            fused_v_scale = self.v_scale
+
         # Apply fused kernel: RoPE on q,k + write k,v to cache
         # q_3d and k are views of the original tensors so in-place update
         # propagates back to the caller.
@@ -1229,8 +1262,8 @@ class AiterAttnBackend(AttentionBackend):
             positions,              # (T,) token positions
             cos_cache,              # (max_pos, 1, 1, D//2)
             sin_cache,              # (max_pos, 1, 1, D//2)
-            self.k_scale,           # k_scale
-            self.v_scale,           # v_scale
+            fused_k_scale,          # k_scale (dynamic for FP8)
+            fused_v_scale,          # v_scale (dynamic for FP8)
             is_neox,
             flash_layout=True,
             apply_scale=(self.kv_cache_dtype == fp8_dtype),
@@ -1272,7 +1305,8 @@ class AiterAttnBackend(AttentionBackend):
                 if _has_fused_rope:
                     # Fused path: apply RoPE and write to cache in one kernel
                     self._apply_fused_rope_and_cache(
-                        q, k, v, layer, forward_batch, cache_loc
+                        q, k, v, layer, forward_batch, cache_loc,
+                        is_extend=True,
                     )
                 else:
                     # Original path: separate RoPE (already applied) + set_kv_buffer
@@ -1642,10 +1676,25 @@ class AiterAttnBackend(AttentionBackend):
 
             q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-            # FP8 with prefix: fall back to full buffer conversion
+            # FP8 with prefix: dequantize only the entries we actually need.
+            # Converting the entire pool (100+ GB) would be catastrophically slow.
+            # Instead, gather only the indexed entries to a compact bf16 buffer.
             if self.kv_cache_dtype == fp8_dtype:
-                k_cache = k_cache.to(torch.bfloat16)
-                v_cache = v_cache.to(torch.bfloat16)
+                lid = layer.layer_id
+                # all_kv_indices holds the flat indices into the pool for all
+                # prefix+extend KV tokens.  Gather those specific rows.
+                idx = all_kv_indices[:total_kv_len].long()
+                k_gathered = k_cache[idx].to(torch.bfloat16) * self._fp8_k_scale_per_layer[lid]
+                v_gathered = v_cache[idx].to(torch.bfloat16) * self._fp8_v_scale_per_layer[lid]
+                # Build a contiguous pool just for these entries so the kernel can
+                # use sequential 0..N-1 indices.
+                k_cache = k_gathered
+                v_cache = v_gathered
+                # Remap indices to [0, total_kv_len)
+                all_kv_indices = torch.arange(
+                    total_kv_len + 256, dtype=torch.int32, device=self.device
+                )
+                all_kv_indices[total_kv_len:] = 0  # padding
 
             o_aiter = mha_batch_prefill_func(
                 q_view,
@@ -1802,11 +1851,16 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache_view = k_cache
                 v_cache_view = v_cache
 
-            # FP8 decode scales: the fused RoPE+cache kernel writes with
-            # self.k_scale / self.v_scale (default 1.0), so use them directly.
-            # No per-layer copy needed — same scale for all layers.
-            decode_k_scale = self.k_scale
-            decode_v_scale = self.v_scale
+            # FP8 decode scales: use the frozen per-layer scales that were
+            # calibrated on the first extend.  These are views into a persistent
+            # tensor, so the data_ptr is stable for CUDA graph replay.
+            if self.kv_cache_dtype == fp8_dtype:
+                lid = layer.layer_id
+                decode_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
+                decode_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
+            else:
+                decode_k_scale = self.k_scale
+                decode_v_scale = self.v_scale
 
             # Get sinks from kwargs (passed from model for attention sink support)
             sinks = kwargs.get("sinks", None)
