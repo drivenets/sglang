@@ -268,10 +268,9 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
-        attn_backend = get_global_server_args().attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        # Always store sinks as float32: the paged-attention kernel expects float32
+        # sinks, so storing them as bf16 wastes a conversion kernel on every decode step.
+        sinks_dtype = torch.float32
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
