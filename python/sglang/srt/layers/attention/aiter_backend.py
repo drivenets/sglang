@@ -1600,19 +1600,26 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            # Fallback: read from KV cache via mha_batch_prefill_func
-            # (used for extends with prefix tokens that need cache reads)
+            # Fallback: extends with prefix tokens need full KV context.
+            # Instead of mha_batch_prefill (CK kernel that can crash under
+            # high concurrency on gfx950), we gather K/V from cache into
+            # contiguous buffers and use flash_attn_varlen_func.
+
+            # Build cu_seqlens for Q (extend tokens only)
             cu_seqlens_q = self.qo_indptr
             cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             cu_seqlens_q = cu_seqlens_q[:bs0]
-
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
 
-            # Compute kv_indptr and kv_page_indices for ALL tokens (prefix + extend)
-            all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
-            all_kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+            # Build cu_seqlens for K (full seq_lens including prefix)
+            cu_seqlens_k = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+            cu_seqlens_k[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
 
-            total_kv_len = int(all_kv_indptr[bs].item())
+            total_kv_len = int(cu_seqlens_k[bs].item())
+
+            max_seqlen_k = max(forward_batch.seq_lens_cpu)
+
+            # Gather KV indices from req_to_token
             all_kv_indices = torch.empty(
                 max(total_kv_len, 1), dtype=torch.int32, device=self.device
             )
@@ -1621,45 +1628,39 @@ class AiterAttnBackend(AttentionBackend):
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    all_kv_indptr,
+                    cu_seqlens_k,
                     None,
                     all_kv_indices,
                     self.req_to_token.stride(0),
                 )
 
-            seqlen_k = forward_batch.seq_lens[:bs].to(torch.int32)
-            max_seqlen_k = max(forward_batch.seq_lens_cpu)
-
-            if sliding_window_size > 0:
-                window_size = (sliding_window_size, 0)
-            else:
-                window_size = (-1, -1)
-
-            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-
-            # FP8 with prefix: fall back to full buffer conversion
+            # FP8 with prefix: convert cache to BF16
             if self.kv_cache_dtype == fp8_dtype:
                 k_cache = k_cache.to(torch.bfloat16)
                 v_cache = v_cache.to(torch.bfloat16)
 
-            o_aiter = mha_batch_prefill_func(
+            # Gather K/V from cache into contiguous (total_kv, heads, dim) tensors
+            kv_indices_long = all_kv_indices[:total_kv_len].long()
+            k_gathered = torch.index_select(k_cache, 0, kv_indices_long)
+            v_gathered = torch.index_select(v_cache, 0, kv_indices_long)
+
+            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+            o = flash_attn_varlen_func(
                 q_view,
-                k_cache,
-                v_cache,
+                k_gathered,
+                v_gathered,
                 cu_seqlens_q,
-                all_kv_indptr,
-                all_kv_indices,
+                cu_seqlens_k,
                 max_extend_len,
                 max_seqlen_k,
                 softmax_scale=layer.scaling,
-                logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
                 causal=True,
-                window_size=window_size,
-                seqlen_k=seqlen_k,
+                window_size=(sliding_window_size, 0, 0) if sliding_window_size > 0 else (-1, -1, 0),
                 sink_ptr=sink_ptr,
             )
 
-            return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
