@@ -2537,42 +2537,68 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            # Fallback: read from KV cache via mha_batch_prefill_func
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
+            # Fallback: extends with prefix tokens need full KV context.
+            # Instead of mha_batch_prefill (CK kernel that can crash under
+            # high concurrency on gfx950), we gather K/V from cache into
+            # contiguous buffers and use flash_attn_varlen_func.
+
+            bs = forward_batch.batch_size
+
+            # Build cu_seqlens for Q (extend tokens only)
+            cu_seqlens_q = self.qo_indptr
+            cu_seqlens_q[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            cu_seqlens_q = cu_seqlens_q[:bs0]
+            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+
+            # Build cu_seqlens for K (full seq_lens including prefix)
+            cu_seqlens_k = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+            cu_seqlens_k[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+
+            total_kv_len = int(cu_seqlens_k[bs].item())
+            max_seqlen_k = max(forward_batch.seq_lens_cpu)
+
+            # Gather KV indices from req_to_token
+            all_kv_indices = torch.empty(
+                max(total_kv_len, 1), dtype=torch.int32, device=self.device
+            )
+            if total_kv_len > 0:
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    cu_seqlens_k,
+                    None,
+                    all_kv_indices,
+                    self.req_to_token.stride(0),
+                )
+
+            # FP8 with prefix: convert cache to BF16
             if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                k_cache = k_cache.to(self.input_dtype)
+                v_cache = v_cache.to(self.input_dtype)
 
-            window_size = (-1, -1)
-            page_table = self.forward_metadata.kv_indices
+            # Gather K/V from cache into contiguous (total_kv, heads, dim) tensors
+            kv_indices_long = all_kv_indices[:total_kv_len].long()
+            k_gathered = torch.index_select(k_cache, 0, kv_indices_long)
+            v_gathered = torch.index_select(v_cache, 0, kv_indices_long)
 
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = (layer.sliding_window_size, -1)
-                if self.forward_metadata.swa_page_table is not None:
-                    page_table = self.forward_metadata.swa_page_table
+            q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                page_table,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
+            o = flash_attn_varlen_func(
+                q_view,
+                k_gathered,
+                v_gathered,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_extend_len,
+                max_seqlen_k,
+                softmax_scale=layer.scaling,
                 causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=window_size,
-                sink_ptr=sinks,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
+                window_size=(sliding_window_size, 0, 0) if sliding_window_size > 0 else (-1, -1, 0),
+                sink_ptr=sink_ptr,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
