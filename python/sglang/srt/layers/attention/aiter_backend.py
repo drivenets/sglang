@@ -248,6 +248,8 @@ class AiterAttnBackend(AttentionBackend):
         self._fp8_v_scale_per_layer = torch.ones(
             num_layers, dtype=torch.float32, device=self.device
         )
+        # Track which layers have been calibrated (first-extend scale computation)
+        self._fp8_scales_calibrated = [False] * num_layers
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
@@ -2053,6 +2055,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         cache_loc: torch.Tensor,
+        is_extend: bool = False,
     ):
         """Apply fused RoPE + KV cache write using aiter kernel.
 
@@ -2098,6 +2101,36 @@ class AiterAttnBackend(AttentionBackend):
         k_cache_4d = k_cache.unsqueeze(1)
         v_cache_4d = v_cache.unsqueeze(1)
 
+        # Determine FP8 scaling for KV cache write.
+        # For FP8, we need proper dynamic scales to avoid saturation/precision loss.
+        # Strategy: calibrate per-layer scales during the FIRST extend call for each
+        # layer, then freeze them.  This gives correct scales with zero overhead on
+        # subsequent extends and all decode steps.
+        if self.kv_cache_dtype == fp8_dtype:
+            lid = layer.layer_id
+            if is_extend and not self._fp8_scales_calibrated[lid]:
+                # First extend for this layer: compute scale from data.
+                # RoPE is a rotation so magnitudes are preserved; pre-RoPE
+                # absmax is a valid proxy for post-RoPE values.
+                k_absmax = k.abs().amax()
+                v_absmax = v.abs().amax()
+                k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
+                v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                self._fp8_k_scale_per_layer[lid] = k_scale_new
+                self._fp8_v_scale_per_layer[lid] = v_scale_new
+                self._fp8_scales_calibrated[lid] = True
+                if lid == 0:
+                    logger.info(
+                        f"FP8 KV cache: calibrated layer {lid} "
+                        f"k_scale={k_scale_new.item():.4f} v_scale={v_scale_new.item():.4f}"
+                    )
+            # Use the (frozen) per-layer scale — a view into the persistent tensor.
+            fused_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
+            fused_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
+        else:
+            fused_k_scale = self.k_scale
+            fused_v_scale = self.v_scale
+
         # Apply fused kernel: RoPE on q,k + write k,v to cache
         # q_3d and k are views of the original tensors so in-place update
         # propagates back to the caller.
@@ -2111,8 +2144,8 @@ class AiterAttnBackend(AttentionBackend):
             positions,              # (T,) token positions
             cos_cache,              # (max_pos, 1, 1, D//2)
             sin_cache,              # (max_pos, 1, 1, D//2)
-            self.k_scale,           # k_scale
-            self.v_scale,           # v_scale
+            fused_k_scale,          # k_scale (dynamic for FP8)
+            fused_v_scale,          # v_scale (dynamic for FP8)
             is_neox,
             flash_layout=True,
             apply_scale=(self.kv_cache_dtype == fp8_dtype),
@@ -2150,9 +2183,6 @@ class AiterAttnBackend(AttentionBackend):
             if save_kv_cache:
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
-                # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
-                # use standard set_kv_buffer, as they lack SWA-specific attributes
-                # like full_to_swa_index_mapping.
                 if (
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
