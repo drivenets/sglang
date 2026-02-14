@@ -54,6 +54,7 @@ try:
 except ImportError:
     _has_fused_rope_cache = False
 
+
 from sglang.srt.compilation.piecewise_context_manager import is_piecewise_capture_active
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -226,6 +227,8 @@ class AiterAttnBackend(AttentionBackend):
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
+        # Persistent ones buffer for Q descale (Q is cast to FP8 without scaling)
+        self._ones_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._fp8_safe_max = 400.0  # Safe max for FP8 E4M3 (actual max is 448)
         self._fp8_safe_max_t = torch.tensor(
             [self._fp8_safe_max], dtype=torch.float32, device=self.device
@@ -1232,15 +1235,27 @@ class AiterAttnBackend(AttentionBackend):
                 # absmax is a valid proxy for post-RoPE values.
                 k_absmax = k.abs().amax()
                 v_absmax = v.abs().amax()
-                k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
-                v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                # Scale so that absmax maps to _fp8_safe_max (400), utilizing
+                # the full FP8 dynamic range.  min=1e-12 prevents div-by-zero
+                # for all-zero tensors.
+                k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
+                v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
                 self._fp8_k_scale_per_layer[lid] = k_scale_new
                 self._fp8_v_scale_per_layer[lid] = v_scale_new
                 self._fp8_scales_calibrated[lid] = True
-                if lid == 0:
+                if lid < 3 or lid == 79:
+                    k_flat = k.abs().flatten().float()
+                    v_flat = v.abs().flatten().float()
+                    k_p99 = torch.quantile(k_flat, 0.99).item()
+                    k_p999 = torch.quantile(k_flat, 0.999).item()
+                    v_p99 = torch.quantile(v_flat, 0.99).item()
+                    v_p999 = torch.quantile(v_flat, 0.999).item()
                     logger.info(
                         f"FP8 KV cache: calibrated layer {lid} "
-                        f"k_scale={k_scale_new.item():.4f} v_scale={v_scale_new.item():.4f}"
+                        f"k_scale={k_scale_new.item():.6f} v_scale={v_scale_new.item():.6f} "
+                        f"k_absmax={k_absmax.item():.4f} v_absmax={v_absmax.item():.4f} "
+                        f"k_p99={k_p99:.4f} k_p999={k_p999:.4f} "
+                        f"v_p99={v_p99:.4f} v_p999={v_p999:.4f}"
                     )
             # Use the (frozen) per-layer scale — a view into the persistent tensor.
             fused_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
@@ -1316,8 +1331,8 @@ class AiterAttnBackend(AttentionBackend):
                         # Compute dynamic scales on GPU, store in per-layer tensors
                         k_absmax = k.abs().amax()
                         v_absmax = v.abs().amax()
-                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1.0)
-                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1.0)
+                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
+                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
                         # Update running max (extend is not graph-captured)
                         lid = layer.layer_id
                         self._fp8_k_scale_per_layer[lid] = torch.maximum(
@@ -1676,42 +1691,52 @@ class AiterAttnBackend(AttentionBackend):
 
             q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-            # FP8 with prefix: dequantize only the entries we actually need.
-            # Converting the entire pool (100+ GB) would be catastrophically slow.
-            # Instead, gather only the indexed entries to a compact bf16 buffer.
+            # FP8 KV cache: gather + dequant + BF16 CK attention.
+            # Using the old gather+dequant path while we investigate FP8 quality.
             if self.kv_cache_dtype == fp8_dtype:
                 lid = layer.layer_id
-                # all_kv_indices holds the flat indices into the pool for all
-                # prefix+extend KV tokens.  Gather those specific rows.
                 idx = all_kv_indices[:total_kv_len].long()
                 k_gathered = k_cache[idx].to(torch.bfloat16) * self._fp8_k_scale_per_layer[lid]
                 v_gathered = v_cache[idx].to(torch.bfloat16) * self._fp8_v_scale_per_layer[lid]
-                # Build a contiguous pool just for these entries so the kernel can
-                # use sequential 0..N-1 indices.
-                k_cache = k_gathered
-                v_cache = v_gathered
-                # Remap indices to [0, total_kv_len)
-                all_kv_indices = torch.arange(
+                # Remap indices to contiguous [0, total_kv_len)
+                contiguous_indices = torch.arange(
                     total_kv_len + 256, dtype=torch.int32, device=self.device
                 )
-                all_kv_indices[total_kv_len:] = 0  # padding
+                contiguous_indices[total_kv_len:] = 0
+                o_aiter = mha_batch_prefill_func(
+                    q_view,
+                    k_gathered,
+                    v_gathered,
+                    cu_seqlens_q,
+                    all_kv_indptr,
+                    contiguous_indices,
+                    max_extend_len,
+                    max_seqlen_k,
+                    softmax_scale=layer.scaling,
+                    logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                    causal=True,
+                    window_size=window_size,
+                    seqlen_k=seqlen_k,
+                    sink_ptr=sink_ptr,
+                )
 
-            o_aiter = mha_batch_prefill_func(
-                q_view,
-                k_cache,
-                v_cache,
-                cu_seqlens_q,
-                all_kv_indptr,
-                all_kv_indices,
-                max_extend_len,
-                max_seqlen_k,
-                softmax_scale=layer.scaling,
-                logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
-                causal=True,
-                window_size=window_size,
-                seqlen_k=seqlen_k,
-                sink_ptr=sink_ptr,
-            )
+            else:
+                o_aiter = mha_batch_prefill_func(
+                    q_view,
+                    k_cache,
+                    v_cache,
+                    cu_seqlens_q,
+                    all_kv_indptr,
+                    all_kv_indices,
+                    max_extend_len,
+                    max_seqlen_k,
+                    softmax_scale=layer.scaling,
+                    logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                    causal=True,
+                    window_size=window_size,
+                    seqlen_k=seqlen_k,
+                    sink_ptr=sink_ptr,
+                )
 
             return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
