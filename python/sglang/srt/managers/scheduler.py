@@ -1082,6 +1082,9 @@ class Scheduler(
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
         )
+        # Prefill-decode interleaving for non-mixed mode:
+        # After each prefill batch, force a decode batch before the next prefill.
+        self._last_batch_was_prefill = False
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -2512,8 +2515,18 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        # Prefill-decode interleaving for non-mixed mode:
+        # After each prefill batch, force a decode batch before the next prefill.
+        skip_prefill_for_interleave = (
+            not self.is_mixed_chunk
+            and self._last_batch_was_prefill
+            and not self.running_batch.is_empty()
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
+        elif skip_prefill_for_interleave:
+            new_batch = None
         else:
             new_batch = self.get_new_batch_prefill()
 
@@ -2524,16 +2537,14 @@ class Scheduler(
             and not self.server_args.speculative_skip_dp_mlp_sync
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
-            # Before merging the new batch into running batch:
-            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
-            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
-            # Run prefill first if possible
+            self._last_batch_was_prefill = True
             ret = new_batch
         else:
+            self._last_batch_was_prefill = False
             # Run decode (skip for prefill-only batches)
             if (
                 not self.running_batch.is_empty()
