@@ -770,6 +770,33 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
 
+        # --- Extend/MIXED graph buffers ---
+        # Pre-allocate buffers for CUDA-graph-captured EXTEND/MIXED forward passes.
+        # These avoid dynamic allocations and .item() calls inside forward_extend.
+        self._extend_graph_mode = False
+        self._extend_graph_max_extend_len = 0
+        self._extend_graph_max_seqlen_k = 0
+        self._extend_graph_bs = 0
+        # all_kv_indices for the prefix-path mha_batch_prefill_func.
+        # Size: max_bs * max_context_len + 256 (padding for AITER overread)
+        self.cuda_graph_extend_kv_indices = torch.zeros(
+            max_bs * self.max_context_len + 256,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # kv_indptr for extend (different from decode kv_indptr)
+        self.cuda_graph_extend_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        # qo_indptr for extend
+        self.cuda_graph_extend_qo_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        # seqlen_k per request for mha_batch_prefill_func
+        self.cuda_graph_extend_seqlen_k = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and _use_mla_ps_kernel:
             # for persistent mla_decode_fwd
@@ -1070,6 +1097,61 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
+        elif forward_mode.is_extend():
+            # EXTEND/MIXED graph capture: set up pre-allocated buffers for
+            # forward_extend's prefix path (mha_batch_prefill_func).
+            # This avoids dynamic allocations and .item() calls inside the graph.
+            kv_indptr = self.cuda_graph_extend_kv_indptr[: bs + 1]
+            kv_indptr[0] = 0
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+
+            kv_indices = self.cuda_graph_extend_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            # Fill tail with a valid index to prevent out-of-bounds reads
+            # by mha_batch_prefill which over-reads by up to 128 elements
+            kv_indices[kv_indptr[bs] :] = kv_indices[0]
+
+            # qo_indptr: cumulative extend lengths
+            qo_indptr = self.cuda_graph_extend_qo_indptr[: bs + 1]
+            qo_indptr[0] = 0
+            # During capture we use dummy extend_seq_lens.
+            # For a MIXED batch, decode reqs have extend_len=1,
+            # extend reqs have extend_len=chunk_size.
+            # Use 1 for all during capture (will be overwritten at replay).
+            qo_indptr[1 : bs + 1] = torch.arange(
+                1, bs + 1, dtype=torch.int32, device=self.device
+            )
+
+            # seqlen_k per request
+            seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+            seqlen_k.copy_(seq_lens[:bs].to(torch.int32))
+
+            # Use conservative max values for graph capture.
+            # Extra kernel blocks will exit early via indptr checks.
+            max_extend_len = self.max_context_len
+            max_seqlen_k = self.max_context_len
+
+            self._extend_graph_mode = True
+            self._extend_graph_max_extend_len = max_extend_len
+            self._extend_graph_max_seqlen_k = max_seqlen_k
+            self._extend_graph_bs = bs
+
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                None,
+                max_extend_len,
+                max_seqlen_k,
+            )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -1143,6 +1225,35 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+
+        elif forward_mode.is_extend():
+            # EXTEND/MIXED graph replay: update pre-allocated buffers with
+            # actual batch data before the captured graph replays.
+            kv_indptr = self.cuda_graph_extend_kv_indptr[: bs + 1]
+            kv_indptr[0] = 0
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+
+            kv_indices = self.cuda_graph_extend_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_indices[kv_indptr[bs] :] = kv_indices[0]
+
+            # qo_indptr: actual extend lengths per request.
+            # For MIXED, this is passed via extend_seq_lens in the forward_batch
+            # which gets populated by replay_prepare. We'll update it there.
+            # NOTE: qo_indptr is filled by the caller (CudaGraphRunner.replay_prepare)
+            # via forward_batch.extend_seq_lens before calling this method.
+
+            # seqlen_k per request
+            seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+            seqlen_k.copy_(seq_lens[:bs].to(torch.int32))
 
         elif forward_mode.is_draft_extend():
             seq_lens = seq_lens[:bs]
@@ -1581,6 +1692,65 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 o = torch.empty_like(q)
 
+            # ---- CUDA graph-safe extend path ----
+            # When _extend_graph_mode is True, all metadata is pre-computed in
+            # init_forward_metadata_{capture,replay}_cuda_graph. We skip dynamic
+            # allocations, .item() calls, and CPU-side checks.
+            if self._extend_graph_mode:
+                bs = self._extend_graph_bs
+                bs0 = bs + 1
+
+                # Sliding window not supported in graph mode (rare for gpt-oss)
+                sliding_window_size = -1
+                window_size = (-1, -1)
+
+                # Extract attention sinks
+                sinks = kwargs.get("sinks", None)
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
+                # Use pre-allocated graph buffers (filled during replay_prepare)
+                cu_seqlens_q = self.cuda_graph_extend_qo_indptr[:bs0]
+                all_kv_indptr = self.cuda_graph_extend_kv_indptr[:bs0]
+                all_kv_indices = self.cuda_graph_extend_kv_indices
+                seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+                max_extend_len = self._extend_graph_max_extend_len
+                max_seqlen_k = self._extend_graph_max_seqlen_k
+
+                q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+                if self.kv_cache_dtype == fp8_dtype:
+                    lid = layer.layer_id
+                    total_kv = all_kv_indptr[bs]
+                    idx = all_kv_indices[:total_kv].long()
+                    k_gathered = k_cache[idx].to(torch.bfloat16) * self._fp8_k_scale_per_layer[lid]
+                    v_gathered = v_cache[idx].to(torch.bfloat16) * self._fp8_v_scale_per_layer[lid]
+                    contiguous_indices = torch.arange(
+                        all_kv_indices.shape[0], dtype=torch.int32, device=self.device
+                    )
+                    o_aiter = mha_batch_prefill_func(
+                        q_view, k_gathered, v_gathered,
+                        cu_seqlens_q, all_kv_indptr, contiguous_indices,
+                        max_extend_len, max_seqlen_k,
+                        softmax_scale=layer.scaling,
+                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                        causal=True, window_size=window_size,
+                        seqlen_k=seqlen_k, sink_ptr=sink_ptr,
+                    )
+                else:
+                    o_aiter = mha_batch_prefill_func(
+                        q_view, k_cache, v_cache,
+                        cu_seqlens_q, all_kv_indptr, all_kv_indices,
+                        max_extend_len, max_seqlen_k,
+                        softmax_scale=layer.scaling,
+                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                        causal=True, window_size=window_size,
+                        seqlen_k=seqlen_k, sink_ptr=sink_ptr,
+                    )
+                return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # ---- Original (non-graph) extend path ----
             # Determine sliding window settings
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 sliding_window_size = layer.sliding_window_size

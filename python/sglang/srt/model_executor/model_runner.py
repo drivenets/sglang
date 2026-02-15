@@ -112,6 +112,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
+    MixedCudaGraphRunner,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -591,6 +592,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_device_graphs()
         else:
             self.graph_runner = None
+            self.mixed_graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
@@ -2048,6 +2050,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+        # Capture MIXED (chunked prefill + decode) CUDA graphs
+        # TEMPORARILY DISABLED - MixedCudaGraphRunner produces incorrect outputs
+        self.mixed_graph_runner = None
+        # if (
+        #     self.server_args.enable_mixed_chunk
+        #     and self.device not in ("cpu", "npu")
+        #     and not self.server_args.disable_cuda_graph
+        # ):
+        #     try:
+        #         mixed_before = get_available_gpu_memory(self.device, self.gpu_id)
+        #         mixed_tic = time.perf_counter()
+        #         self.mixed_graph_runner = MixedCudaGraphRunner(self)
+        #         mixed_after = get_available_gpu_memory(self.device, self.gpu_id)
+        #         logger.info(
+        #             f"Capture MIXED CUDA graphs end. "
+        #             f"Time: {time.perf_counter() - mixed_tic:.2f}s. "
+        #             f"mem: {mixed_before - mixed_after:.2f} GB. "
+        #             f"avail: {mixed_after:.2f} GB."
+        #         )
+        #     except Exception as e:
+        #         logger.warning(
+        #             f"Failed to capture MIXED CUDA graphs: {e}. "
+        #             "MIXED batches will use non-graph path."
+        #         )
+        #         self.mixed_graph_runner = None
+
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
@@ -2343,6 +2371,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+        # Try MIXED CUDA graph for chunked-prefill + decode batches
+        # TEMPORARILY DISABLED for debugging - skip graph replay
+        # if (
+        #     self.mixed_graph_runner is not None
+        #     and self.mixed_graph_runner.can_run(forward_batch)
+        # ):
+        #     ret = self.mixed_graph_runner.replay(forward_batch)
+        #     return ModelRunnerOutput(logits_output=ret, can_run_graph=True)
 
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
