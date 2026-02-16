@@ -4207,6 +4207,7 @@ class ServerArgs:
                 "lpm",
                 "random",
                 "fcfs",
+                "sif",
                 "dfs-weight",
                 "lof",
                 "priority",

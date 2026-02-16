@@ -174,6 +174,15 @@ class AiterAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
 
+        # CUDA graph extend mode flags
+        self._extend_no_prefix_graph_mode = False
+        self._extend_nopfx_graph_max_seqlen = 0
+        self._extend_nopfx_graph_bs = 0
+        self._extend_graph_mode = False
+
+        # Sliding window support
+        self.sliding_window_size = model_runner.sliding_window_size
+
         max_bs = model_runner.req_to_token_pool.size
 
         if kv_indptr_buf is None:
@@ -1263,6 +1272,11 @@ class AiterAttnBackend(AttentionBackend):
         self._extend_graph_max_extend_len = 0
         self._extend_graph_max_seqlen_k = 0
         self._extend_graph_bs = 0
+
+        # Extend no-prefix graph mode
+        self._extend_no_prefix_graph_mode = False
+        self._extend_nopfx_graph_max_seqlen = 0
+        self._extend_nopfx_graph_bs = 0
         self.cuda_graph_extend_kv_indices = torch.zeros(
             max_bs * self.max_context_len + 256,
             dtype=torch.int32,
@@ -2186,6 +2200,20 @@ class AiterAttnBackend(AttentionBackend):
         is_neox = layer._fused_rope_is_neox
         positions = layer._fused_rope_positions[:num_tokens]
 
+        # For SWA layers, get_key_buffer returns the SWA pool (smaller than full).
+        # cache_loc is in full pool space — translate to SWA space so the fused
+        # kernel writes to the correct SWA slot.  Without this, the kernel does
+        # swa_buffer[full_pool_index] → out-of-bounds write → hipErrorIllegalAddress.
+        # NOTE: We index the mapping tensor directly (graph-safe GPU op) instead of
+        # calling translate_loc_from_full_to_swa which has CPU sync in bounds check.
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
+            mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+            cache_loc = mapping[cache_loc].long()
+
         # Get KV cache buffers and reshape for flash_layout (block_size=1)
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -2627,7 +2655,40 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # ---- CUDA graph-safe extend path ----
+            # ---- Whole-model CUDA graph: extend_no_prefix path ----
+            if self._extend_no_prefix_graph_mode:
+                bs = self._extend_nopfx_graph_bs
+                bs0 = bs + 1
+                max_len = self._extend_nopfx_graph_max_seqlen
+                sliding_window_size = -1
+                window_size = (-1, -1, 0)
+
+                sinks = kwargs.get("sinks", None)
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
+                cu_seqlens = self.cuda_graph_extend_qo_indptr
+                cu_seqlens[1 : bs + 1] = torch.cumsum(
+                    forward_batch.extend_seq_lens[:bs], dim=0
+                )
+                cu_seqlens_slice = cu_seqlens[:bs0]
+
+                q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+                o_attn = flash_attn_varlen_func(
+                    q_view, k, v,
+                    cu_seqlens_slice, cu_seqlens_slice,
+                    max_len, max_len,
+                    min_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    sink_ptr=sink_ptr,
+                )
+                return o_attn.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # ---- CUDA graph-safe extend path (KV cache read) ----
             if self._extend_graph_mode:
                 bs = self._extend_graph_bs
                 bs0 = bs + 1
