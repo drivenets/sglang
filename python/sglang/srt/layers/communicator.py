@@ -131,6 +131,8 @@ def _try_aiter_fused_ar_rmsnorm(
         hidden_states.shape[-1], hidden_states.dtype
     ):
         return None
+    if torch.compiler.is_compiling():
+        return None
     result = ca_comm.custom_fused_ar_rms(
         hidden_states,
         residual,
