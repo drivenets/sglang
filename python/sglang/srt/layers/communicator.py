@@ -99,6 +99,47 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
+def _aiter_fused_ar_rmsnorm_supported(hidden_size: int, dtype: torch.dtype) -> bool:
+    """Check if aiter's fused allreduce+RMSNorm kernel supports the given shape.
+    The kernel requires hidden_size to be divisible by pack_size (8 for bf16/fp16,
+    4 for fp32) and n_bytes to be within [16, 32768].
+    """
+    pack_size = 16 // dtype.itemsize  # 8 for bf16/fp16, 4 for fp32
+    n_bytes = hidden_size * dtype.itemsize
+    return hidden_size % pack_size == 0 and 16 <= n_bytes <= 32768
+
+
+def _try_aiter_fused_ar_rmsnorm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    layernorm: torch.nn.Module,
+):
+    """Try to use aiter's fused allreduce+residual+RMSNorm kernel.
+    Returns (hidden_states, residual) on success, or None if not applicable
+    (e.g. tensor too large for custom all-reduce, unsupported shape, or aiter not available).
+    """
+    if not _use_aiter:
+        return None
+    ca_comm = get_tp_group().ca_comm
+    if ca_comm is None:
+        return None
+    if not hasattr(layernorm, "weight") or not hasattr(
+        layernorm, "variance_epsilon"
+    ):
+        return None
+    if not _aiter_fused_ar_rmsnorm_supported(
+        hidden_states.shape[-1], hidden_states.dtype
+    ):
+        return None
+    result = ca_comm.custom_fused_ar_rms(
+        hidden_states,
+        residual,
+        layernorm.weight.data,
+        layernorm.variance_epsilon,
+    )
+    return result
+
+
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
@@ -598,11 +639,34 @@ class LayerCommunicator:
             else 0
         )
 
-        return (
+        if (
             apply_flashinfer_allreduce_fusion(batch_size)
             and (not self.is_last_layer)
             and (self._context.tp_size > 1)
-        )
+        ):
+            return True
+
+        if (
+            _use_aiter
+            and (not self.is_last_layer)
+            and (self._context.tp_size > 1)
+            and batch_size > 0
+            and _aiter_fused_ar_rmsnorm_supported(
+                self.input_layernorm.weight.shape[0],
+                self.input_layernorm.weight.dtype,
+            )
+        ):
+            ca_comm = get_tp_group().ca_comm
+            if ca_comm is not None and not ca_comm.disabled:
+                inp_bytes = (
+                    batch_size
+                    * self.input_layernorm.weight.shape[0]
+                    * self.input_layernorm.weight.dtype.itemsize
+                )
+                if inp_bytes <= ca_comm.max_size:
+                    return True
+
+        return False
 
 
 @dataclass
@@ -806,10 +870,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                if _is_npu and context.cache is not None:
-                    _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                fused = _try_aiter_fused_ar_rmsnorm(
+                    hidden_states, residual, layernorm
+                )
+                if fused is not None:
+                    hidden_states, residual = fused
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    if _is_npu and context.cache is not None:
+                        _ = prepare_weight_cache(hidden_states, context.cache)
+                    hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod

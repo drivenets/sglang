@@ -740,6 +740,13 @@ class Scheduler(
         # Prefill-decode interleaving for non-mixed mode:
         # After each prefill batch, force a decode batch before the next prefill.
         self._last_batch_was_prefill = False
+        # SGLANG_INTERLEAVE_THRESHOLD: minimum number of running (decode) requests
+        # before forcing a decode batch between prefills. Higher values allow more
+        # consecutive prefills during burst arrival, clearing the prefill queue faster.
+        # Default 4 (good for short inputs). Set to 20+ for long-input workloads.
+        self._interleave_threshold = int(
+            os.environ.get("SGLANG_INTERLEAVE_THRESHOLD", "4")
+        )
 
         # Init the dynamic chunking predictor for PP
         self.enable_dynamic_chunking = (
@@ -1848,10 +1855,13 @@ class Scheduler(
 
         # Prefill-decode interleaving for non-mixed mode:
         # After each prefill batch, force a decode batch before the next prefill.
+        # Skip the forced decode if the running batch has fewer than
+        # _interleave_threshold requests, allowing consecutive prefills during burst.
         skip_prefill_for_interleave = (
             not self.is_mixed_chunk
             and self._last_batch_was_prefill
             and not self.running_batch.is_empty()
+            and len(self.running_batch.reqs) >= self._interleave_threshold
         )
 
         if skip_prefill_for_interleave:

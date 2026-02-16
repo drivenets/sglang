@@ -1256,6 +1256,331 @@ class MixedCudaGraphRunner:
         return output
 
 
+class ExtendCudaGraphRunner:
+    """Whole-model CUDA graph runner for EXTEND batches (no-prefix path).
+
+    Captures the entire model forward pass as a single CUDA graph for EXTEND
+    batches that use the extend_no_prefix path (flash_attn_varlen_func with
+    fresh Q/K/V, no KV cache reads).
+
+    This eliminates ~17ms of kernel launch overhead per prefill forward pass,
+    reducing 1024-token prefill from ~27ms to ~10ms.
+
+    Only supports batches where all requests have no prefix (extend_prefix_lens=0).
+    """
+
+    def __init__(self, model_runner: "ModelRunner"):
+        self.model_runner = model_runner
+        self.device = model_runner.device
+        self.device_module = torch.get_device_module(self.device)
+
+        # Determine capture token counts (powers of 2)
+        # SGLANG_EXTEND_GRAPH_MAX_TOKENS controls the largest extend graph bucket.
+        # Default 8192. Set higher (e.g. 32768) for long-input workloads.
+        extend_graph_cap = int(os.environ.get("SGLANG_EXTEND_GRAPH_MAX_TOKENS", "8192"))
+        max_capture_tokens = min(
+            model_runner.server_args.chunked_prefill_size or extend_graph_cap,
+            model_runner.server_args.max_prefill_tokens or extend_graph_cap,
+            extend_graph_cap,
+        )
+        self.capture_sizes = []
+        t = 128
+        while t <= max_capture_tokens:
+            self.capture_sizes.append(t)
+            t *= 2
+        if max_capture_tokens not in self.capture_sizes:
+            self.capture_sizes.append(max_capture_tokens)
+        self.capture_sizes.sort()
+
+        # Max batch size for extend (number of requests per batch)
+        self.max_bs = min(32, model_runner.req_to_token_pool.size)
+        self.max_tokens = max(self.capture_sizes)
+
+        # Pre-allocate static buffers
+        dtype = model_runner.model_config.dtype
+        vocab_size = model_runner.model_config.vocab_size
+
+        with torch.device(self.device):
+            self.input_ids = torch.zeros(self.max_tokens, dtype=torch.int64)
+            self.positions = torch.zeros(self.max_tokens, dtype=torch.int64)
+            self.out_cache_loc = torch.zeros(self.max_tokens, dtype=torch.int64)
+            self.req_pool_indices = torch.zeros(self.max_bs, dtype=torch.int64)
+            self.seq_lens = torch.ones(self.max_bs, dtype=torch.int64)
+            self.seq_lens_cpu = torch.ones(self.max_bs, dtype=torch.int64)
+            self.extend_seq_lens = torch.ones(self.max_bs, dtype=torch.int64)
+            self.extend_prefix_lens = torch.zeros(self.max_bs, dtype=torch.int64)
+            self.extend_start_loc = torch.zeros(self.max_bs, dtype=torch.int64)
+
+        self.graphs = {}       # token_count -> CUDAGraph
+        self.output_buffers = {}  # token_count -> LogitsProcessorOutput
+
+        log_info_on_rank0(
+            logger,
+            f"ExtendCudaGraphRunner: capturing sizes={self.capture_sizes}, "
+            f"max_bs={self.max_bs}",
+        )
+
+        attn_backend = model_runner.attn_backend
+        try:
+            with model_capture_mode():
+                self._capture_all()
+        except RuntimeError as e:
+            logger.warning(
+                f"ExtendCudaGraphRunner capture failed: {e}. "
+                "EXTEND batches will fall back to non-graph path."
+            )
+            self.graphs = {}
+        finally:
+            # CRITICAL: Reset graph mode flag after capture
+            attn_backend._extend_no_prefix_graph_mode = False
+
+    def _capture_all(self):
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            with graph_capture() as ctx:
+                self.stream = ctx.stream
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_sizes)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_sizes)
+                )
+                for num_tokens in capture_range:
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail = get_available_gpu_memory(
+                            self.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_range.set_description(
+                            f"Extend graph capture ({num_tokens=} avail={avail:.2f} GB)"
+                        )
+                    graph, out = self._capture_one_size(num_tokens)
+                    self.graphs[num_tokens] = graph
+                    self.output_buffers[num_tokens] = out
+
+    def _capture_one_size(self, num_tokens: int):
+        bs = self.max_bs
+        attn_backend = self.model_runner.attn_backend
+
+        # Distribute tokens across max_bs requests.
+        # Give each request num_tokens // max_bs tokens, with the last
+        # getting the remainder. This ensures cu_seqlens[-1] = num_tokens.
+        per_req = num_tokens // bs
+        remainder = num_tokens - per_req * bs
+        extend_lens = [per_req] * bs
+        extend_lens[-1] += remainder  # Last request gets the extra tokens
+
+        # Set up static buffers for capture
+        input_ids = self.input_ids[:num_tokens]
+        positions = self.positions[:num_tokens]
+        out_cache_loc = self.out_cache_loc[:num_tokens]
+        req_pool_indices = self.req_pool_indices[:bs]
+        seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
+        extend_seq_lens = self.extend_seq_lens[:bs]
+        extend_prefix_lens = self.extend_prefix_lens[:bs]
+        extend_start_loc = self.extend_start_loc[:bs]
+
+        # Fill extend metadata
+        for i, el in enumerate(extend_lens):
+            extend_seq_lens[i] = el
+            seq_lens[i] = el  # No prefix, so seq_lens = extend_seq_lens
+            seq_lens_cpu[i] = el
+        extend_prefix_lens.zero_()
+
+        # Compute extend_start_loc
+        extend_start_loc[0] = 0
+        if bs > 1:
+            extend_start_loc[1:bs] = torch.cumsum(extend_seq_lens[:bs-1], dim=0)
+
+        # CPU lists for Python-level decisions (baked into graph)
+        extend_seq_lens_cpu = extend_lens
+        extend_prefix_lens_cpu = [0] * bs
+
+        # Set attention backend into extend_no_prefix graph mode
+        # max_seqlen = the MAXIMUM possible per-request extend length.
+        # Set to num_tokens (the whole bucket) to handle any request distribution.
+        attn_backend._extend_no_prefix_graph_mode = True
+        attn_backend._extend_nopfx_graph_max_seqlen = num_tokens
+        attn_backend._extend_nopfx_graph_bs = bs
+
+        # Build ForwardBatch
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=num_tokens,
+            orig_seq_lens=seq_lens,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=attn_backend,
+            return_logprob=False,
+            positions=positions,
+            extend_seq_lens=extend_seq_lens[:bs],
+            extend_prefix_lens=extend_prefix_lens[:bs],
+            extend_start_loc=extend_start_loc[:bs],
+            extend_num_tokens=num_tokens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_logprob_start_lens_cpu=[el for el in extend_lens],
+            next_token_logits_buffer=None,
+            global_forward_mode=ForwardMode.EXTEND,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            encoder_lens=None,
+        )
+
+        # Init attention metadata (for the normal forward path)
+        attn_backend.init_forward_metadata(forward_batch)
+
+        def run_once():
+            set_dp_buffer_len(None, num_tokens, False)
+            set_is_extend_in_batch(True)
+            return self.model_runner.model.forward(
+                input_ids,
+                positions,
+                forward_batch,
+            )
+
+        # Warmup (2 runs)
+        for _ in range(2):
+            self.device_module.synchronize()
+            self.model_runner.tp_group.barrier()
+            run_once()
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        pool = get_global_graph_memory_pool()
+        if pool is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+            pool = get_global_graph_memory_pool()
+        set_graph_pool_id(pool)
+
+        with self.device_module.graph(cuda_graph=graph, pool=pool, stream=self.stream):
+            out = run_once()
+
+        return graph, out
+
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
+        """Check if this EXTEND batch can use a captured graph."""
+        if not forward_batch.forward_mode.is_extend():
+            return False
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        if forward_batch.forward_mode.is_draft_extend():
+            return False
+        if not self.graphs:
+            return False
+
+        num_tokens = len(forward_batch.input_ids)
+        if num_tokens > self.max_tokens:
+            return False
+
+        bs = forward_batch.batch_size
+        if bs > self.max_bs:
+            return False
+
+        # Only support extend_no_prefix (all prefix_lens = 0)
+        if forward_batch.extend_prefix_lens_cpu and any(forward_batch.extend_prefix_lens_cpu):
+            return False
+
+        # Don't graph if logprob is requested
+        if forward_batch.return_logprob:
+            return False
+
+        return True
+
+    def _find_capture_size(self, num_tokens: int) -> int:
+        """Find the smallest capture size >= num_tokens."""
+        idx = bisect.bisect_left(self.capture_sizes, num_tokens)
+        if idx >= len(self.capture_sizes):
+            return -1
+        return self.capture_sizes[idx]
+
+    def replay(self, forward_batch: ForwardBatch):
+        """Prepare buffers and replay the captured graph."""
+        raw_bs = forward_batch.batch_size
+        raw_num_tokens = len(forward_batch.input_ids)
+        bs = self.max_bs
+        num_tokens = self._find_capture_size(raw_num_tokens)
+
+        attn_backend = self.model_runner.attn_backend
+
+        # ---- Copy real data to graph buffers ----
+        # Zero out cache_loc for padding (safe dummy writes)
+        if num_tokens != raw_num_tokens:
+            self.out_cache_loc[:num_tokens].zero_()
+
+        # Copy real token data
+        self.input_ids[:raw_num_tokens].copy_(forward_batch.input_ids)
+        self.positions[:raw_num_tokens].copy_(forward_batch.positions)
+        self.out_cache_loc[:raw_num_tokens].copy_(forward_batch.out_cache_loc)
+
+        # Copy request-level data
+        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        if forward_batch.seq_lens_cpu is not None:
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+
+        # Fill extend_seq_lens: real requests get their actual extend lengths,
+        # padding requests distribute the remaining tokens.
+        self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+
+        # Padding: distribute remaining tokens across padded request slots
+        # so that cu_seqlens[-1] = num_tokens (all tokens accounted for).
+        remaining = num_tokens - raw_num_tokens
+        if bs > raw_bs:
+            pad_count = bs - raw_bs
+            per_pad = remaining // pad_count if pad_count > 0 else 0
+            last_pad_extra = remaining - per_pad * pad_count
+            self.extend_seq_lens[raw_bs:bs] = per_pad
+            if last_pad_extra > 0:
+                self.extend_seq_lens[bs - 1] += last_pad_extra
+            # Padded requests: dummy seq_lens and req_pool_indices
+            self.seq_lens[raw_bs:bs] = self.extend_seq_lens[raw_bs:bs]
+            if raw_bs > 0:
+                self.req_pool_indices[raw_bs:bs] = self.req_pool_indices[raw_bs - 1]
+
+        # Extend prefix lens: all zero (no prefix)
+        self.extend_prefix_lens[:bs].zero_()
+
+        # Update extend_start_loc
+        self.extend_start_loc[0] = 0
+        if bs > 1:
+            self.extend_start_loc[1:bs] = torch.cumsum(
+                self.extend_seq_lens[:bs - 1], dim=0
+            )
+
+        # Note: We do NOT call init_forward_metadata during replay.
+        # The graph uses the _extend_no_prefix_graph_mode path in forward_extend,
+        # which computes cu_seqlens internally via torch.cumsum (graph-safe).
+        # The qo_indptr update is handled by the graph's own cumsum kernel.
+
+        # Set runtime flags
+        set_dp_buffer_len(None, num_tokens, False)
+        set_is_extend_in_batch(True)
+
+        # ---- Replay graph ----
+        self.graphs[num_tokens].replay()
+        output = self.output_buffers[num_tokens]
+
+        # Trim output to actual batch size
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[:raw_bs],
+                hidden_states=(
+                    output.hidden_states[:raw_num_tokens]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        return output
+
+
 class DeepEPCudaGraphRunnerAdapter:
     def __init__(self):
         # Record DeepEP mode used during capture to ensure replay consistency

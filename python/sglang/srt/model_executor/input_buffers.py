@@ -159,6 +159,15 @@ class GraphInputBuffers:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
 
+        # Ensure padding request slots use a valid req_pool_index.
+        # Without this, stale indices from previous batches can cause OOB
+        # reads in create_flashinfer_kv_indices_triton / translate_loc_from_full_to_swa
+        # during sliding window buffer updates, leading to hipErrorIllegalAddress.
+        if bs > raw_bs and raw_bs > 0:
+            self.req_pool_indices[raw_bs:bs].fill_(
+                forward_batch.req_pool_indices[raw_bs - 1].item()
+            )
+
         if (
             self.mamba_track_indices is not None
             and forward_batch.mamba_track_indices is not None

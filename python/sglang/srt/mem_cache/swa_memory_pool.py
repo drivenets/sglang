@@ -143,6 +143,18 @@ class SWAKVPool(KVCache):
 
         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
         # since the last item of full_to_swa_index_mapping is -1.
+        max_valid = self.full_to_swa_index_mapping.shape[0] - 1  # last slot is -1 sentinel
+        oob_mask = (kv_indices < -1) | (kv_indices > max_valid)
+        if oob_mask.any():
+            oob_vals = kv_indices[oob_mask]
+            logger.error(
+                f"SWA translate_loc OOB! mapping_size={self.full_to_swa_index_mapping.shape[0]}, "
+                f"num_oob={oob_mask.sum().item()}/{kv_indices.numel()}, "
+                f"oob_min={oob_vals.min().item()}, oob_max={oob_vals.max().item()}, "
+                f"kv_min={kv_indices.min().item()}, kv_max={kv_indices.max().item()}"
+            )
+            # Clamp to valid range to prevent crash; use 0 for OOB (maps to SWA slot 0)
+            kv_indices = kv_indices.clamp(min=-1, max=max_valid)
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
     def set_kv_buffer(

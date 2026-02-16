@@ -290,25 +290,55 @@ class RMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+        Forward method with allreduce fusion, prioritizing flashinfer fused operations.
+        Falls back to aiter fused allreduce+RMSNorm on ROCm when available.
         """
         if residual is not None:
-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
             )
 
             if get_tensor_model_parallel_world_size() > 1:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_result = flashinfer_allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
-                )
-                if fused_result[0] is not None:
-                    return fused_result
+
+                if _use_aiter:
+                    from sglang.srt.distributed.parallel_state import get_tp_group
+
+                    pack_size = 16 // x.dtype.itemsize
+                    n_bytes = x.shape[-1] * x.dtype.itemsize
+                    fused_ok = (
+                        x.shape[-1] % pack_size == 0
+                        and 16 <= n_bytes <= 32768
+                    )
+                    if fused_ok:
+                        ca_comm = get_tp_group().ca_comm
+                        if ca_comm is not None:
+                            result = ca_comm.custom_fused_ar_rms(
+                                x,
+                                residual,
+                                self.weight.data,
+                                self.variance_epsilon,
+                            )
+                            if result is not None:
+                                return result
+                    # Fused kernel not applicable; do separate allreduce + layernorm
+                    x = tensor_model_parallel_all_reduce(x)
+                    return self.forward(x, residual)
+                else:
+                    from sglang.srt.layers.flashinfer_comm_fusion import (
+                        flashinfer_allreduce_residual_rmsnorm,
+                    )
+
+                    fused_result = flashinfer_allreduce_residual_rmsnorm(
+                        input_tensor=x,
+                        residual=residual,
+                        weight=self.weight,
+                        eps=self.variance_epsilon,
+                    )
+                    if fused_result[0] is not None:
+                        return fused_result
 
         return self.forward(x, residual, post_residual_addition)
 

@@ -112,6 +112,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
+    ExtendCudaGraphRunner,
     MixedCudaGraphRunner,
     set_torch_compile_config,
 )
@@ -593,6 +594,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.graph_runner = None
             self.mixed_graph_runner = None
+            self.extend_graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
@@ -2007,6 +2009,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
+        self.extend_graph_runner = None
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2053,28 +2056,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Capture MIXED (chunked prefill + decode) CUDA graphs
         # TEMPORARILY DISABLED - MixedCudaGraphRunner produces incorrect outputs
         self.mixed_graph_runner = None
-        # if (
-        #     self.server_args.enable_mixed_chunk
-        #     and self.device not in ("cpu", "npu")
-        #     and not self.server_args.disable_cuda_graph
-        # ):
-        #     try:
-        #         mixed_before = get_available_gpu_memory(self.device, self.gpu_id)
-        #         mixed_tic = time.perf_counter()
-        #         self.mixed_graph_runner = MixedCudaGraphRunner(self)
-        #         mixed_after = get_available_gpu_memory(self.device, self.gpu_id)
-        #         logger.info(
-        #             f"Capture MIXED CUDA graphs end. "
-        #             f"Time: {time.perf_counter() - mixed_tic:.2f}s. "
-        #             f"mem: {mixed_before - mixed_after:.2f} GB. "
-        #             f"avail: {mixed_after:.2f} GB."
-        #         )
-        #     except Exception as e:
-        #         logger.warning(
-        #             f"Failed to capture MIXED CUDA graphs: {e}. "
-        #             "MIXED batches will use non-graph path."
-        #         )
-        #         self.mixed_graph_runner = None
+
+        # Capture EXTEND (prefill) CUDA graphs — whole-model graphs for
+        # extend_no_prefix batches. Eliminates ~17ms kernel launch overhead.
+        self.extend_graph_runner = None
+        if (
+            self.device not in ("cpu", "npu")
+            and not self.server_args.disable_cuda_graph
+            and not self.server_args.enable_mixed_chunk  # Only for non-mixed mode
+        ):
+            try:
+                extend_before = get_available_gpu_memory(self.device, self.gpu_id)
+                extend_tic = time.perf_counter()
+                self.extend_graph_runner = ExtendCudaGraphRunner(self)
+                extend_after = get_available_gpu_memory(self.device, self.gpu_id)
+                logger.info(
+                    f"Capture EXTEND CUDA graphs end. "
+                    f"Time: {time.perf_counter() - extend_tic:.2f}s. "
+                    f"mem: {extend_before - extend_after:.2f} GB. "
+                    f"avail: {extend_after:.2f} GB."
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to capture EXTEND CUDA graphs: {e}. "
+                    "EXTEND batches will use non-graph path."
+                )
+                import traceback
+                traceback.print_exc()
+                self.extend_graph_runner = None
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
@@ -2224,6 +2233,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+
+        # Try whole-model EXTEND CUDA graph (extend_no_prefix path)
+        can_run_extend_graph = (
+            self.extend_graph_runner is not None
+            and self.extend_graph_runner.can_run(forward_batch)
+        )
+        if can_run_extend_graph:
+            return (
+                self.extend_graph_runner.replay(forward_batch),
+                True,
+            )
 
         can_run_graph = (
             self.piecewise_cuda_graph_runner is not None
