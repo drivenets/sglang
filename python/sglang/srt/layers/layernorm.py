@@ -311,6 +311,7 @@ class RMSNorm(MultiPlatformOp):
                     fused_ok = (
                         x.shape[-1] % pack_size == 0
                         and 16 <= n_bytes <= 32768
+                        and not torch.compiler.is_compiling()
                     )
                     if fused_ok:
                         ca_comm = get_tp_group().ca_comm
