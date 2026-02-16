@@ -145,7 +145,7 @@ class SWAKVPool(KVCache):
         # since the last item of full_to_swa_index_mapping is -1.
         max_valid = self.full_to_swa_index_mapping.shape[0] - 1  # last slot is -1 sentinel
         oob_mask = (kv_indices < -1) | (kv_indices > max_valid)
-        if not torch.cuda.is_current_stream_capturing() and oob_mask.any():
+        if oob_mask.any():
             oob_vals = kv_indices[oob_mask]
             logger.error(
                 f"SWA translate_loc OOB! mapping_size={self.full_to_swa_index_mapping.shape[0]}, "

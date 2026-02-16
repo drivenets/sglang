@@ -146,7 +146,13 @@ class AiterAttnBackend(AttentionBackend):
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
-        
+
+        # CUDA graph extend mode flags (initialized in init_cuda_graph_state if graphs enabled)
+        self._extend_no_prefix_graph_mode = False
+        self._extend_nopfx_graph_max_seqlen = 0
+        self._extend_nopfx_graph_bs = 0
+        self._extend_graph_mode = False
+
         # Sliding window support
         self.sliding_window_size = model_runner.sliding_window_size
 
@@ -770,6 +776,41 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
 
+        # --- Extend/MIXED graph buffers ---
+        # Pre-allocate buffers for CUDA-graph-captured EXTEND/MIXED forward passes.
+        # These avoid dynamic allocations and .item() calls inside forward_extend.
+        self._extend_graph_mode = False
+        self._extend_graph_max_extend_len = 0
+        self._extend_graph_max_seqlen_k = 0
+        self._extend_graph_bs = 0
+
+        # --- Extend no-prefix graph mode ---
+        # For whole-model CUDA graph capture of EXTEND batches (extend_no_prefix path).
+        # When True, forward_extend uses flash_attn_varlen_func with pre-set max_len
+        # instead of computing max() on CPU.
+        self._extend_no_prefix_graph_mode = False
+        self._extend_nopfx_graph_max_seqlen = 0
+        self._extend_nopfx_graph_bs = 0
+        # all_kv_indices for the prefix-path mha_batch_prefill_func.
+        # Size: max_bs * max_context_len + 256 (padding for AITER overread)
+        self.cuda_graph_extend_kv_indices = torch.zeros(
+            max_bs * self.max_context_len + 256,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # kv_indptr for extend (different from decode kv_indptr)
+        self.cuda_graph_extend_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        # qo_indptr for extend
+        self.cuda_graph_extend_qo_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        # seqlen_k per request for mha_batch_prefill_func
+        self.cuda_graph_extend_seqlen_k = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and _use_mla_ps_kernel:
             # for persistent mla_decode_fwd
@@ -1070,6 +1111,61 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
+        elif forward_mode.is_extend():
+            # EXTEND/MIXED graph capture: set up pre-allocated buffers for
+            # forward_extend's prefix path (mha_batch_prefill_func).
+            # This avoids dynamic allocations and .item() calls inside the graph.
+            kv_indptr = self.cuda_graph_extend_kv_indptr[: bs + 1]
+            kv_indptr[0] = 0
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+
+            kv_indices = self.cuda_graph_extend_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            # Fill tail with a valid index to prevent out-of-bounds reads
+            # by mha_batch_prefill which over-reads by up to 128 elements
+            kv_indices[kv_indptr[bs] :] = kv_indices[0]
+
+            # qo_indptr: cumulative extend lengths
+            qo_indptr = self.cuda_graph_extend_qo_indptr[: bs + 1]
+            qo_indptr[0] = 0
+            # During capture we use dummy extend_seq_lens.
+            # For a MIXED batch, decode reqs have extend_len=1,
+            # extend reqs have extend_len=chunk_size.
+            # Use 1 for all during capture (will be overwritten at replay).
+            qo_indptr[1 : bs + 1] = torch.arange(
+                1, bs + 1, dtype=torch.int32, device=self.device
+            )
+
+            # seqlen_k per request
+            seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+            seqlen_k.copy_(seq_lens[:bs].to(torch.int32))
+
+            # Use conservative max values for graph capture.
+            # Extra kernel blocks will exit early via indptr checks.
+            max_extend_len = self.max_context_len
+            max_seqlen_k = self.max_context_len
+
+            self._extend_graph_mode = True
+            self._extend_graph_max_extend_len = max_extend_len
+            self._extend_graph_max_seqlen_k = max_seqlen_k
+            self._extend_graph_bs = bs
+
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                None,
+                max_extend_len,
+                max_seqlen_k,
+            )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -1144,6 +1240,35 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
+        elif forward_mode.is_extend():
+            # EXTEND/MIXED graph replay: update pre-allocated buffers with
+            # actual batch data before the captured graph replays.
+            kv_indptr = self.cuda_graph_extend_kv_indptr[: bs + 1]
+            kv_indptr[0] = 0
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+
+            kv_indices = self.cuda_graph_extend_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_indices[kv_indptr[bs] :] = kv_indices[0]
+
+            # qo_indptr: actual extend lengths per request.
+            # For MIXED, this is passed via extend_seq_lens in the forward_batch
+            # which gets populated by replay_prepare. We'll update it there.
+            # NOTE: qo_indptr is filled by the caller (CudaGraphRunner.replay_prepare)
+            # via forward_batch.extend_seq_lens before calling this method.
+
+            # seqlen_k per request
+            seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+            seqlen_k.copy_(seq_lens[:bs].to(torch.int32))
+
         elif forward_mode.is_draft_extend():
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
@@ -1208,6 +1333,20 @@ class AiterAttnBackend(AttentionBackend):
         sin_cache = layer._fused_rope_sin   # (max_pos, 1, 1, D//2)
         is_neox = layer._fused_rope_is_neox
         positions = layer._fused_rope_positions[:num_tokens]
+
+        # For SWA layers, get_key_buffer returns the SWA pool (smaller than full).
+        # cache_loc is in full pool space — translate to SWA space so the fused
+        # kernel writes to the correct SWA slot.  Without this, the kernel does
+        # swa_buffer[full_pool_index] → out-of-bounds write → hipErrorIllegalAddress.
+        # NOTE: We index the mapping tensor directly (graph-safe GPU op) instead of
+        # calling translate_loc_from_full_to_swa which has CPU sync in bounds check.
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
+            mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+            cache_loc = mapping[cache_loc].long()
 
         # Get KV cache buffers and reshape for flash_layout (block_size=1)
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1581,6 +1720,113 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 o = torch.empty_like(q)
 
+            # ---- Whole-model CUDA graph: extend_no_prefix path ----
+            # When _extend_no_prefix_graph_mode is True, use flash_attn_varlen_func
+            # with pre-set max_len (avoids CPU max() call). The cu_seqlens are
+            # computed by torch.cumsum inside the graph (graph-safe GPU op).
+            # forward_batch.extend_seq_lens is a static buffer updated before replay.
+            if self._extend_no_prefix_graph_mode:
+                bs = self._extend_nopfx_graph_bs
+                bs0 = bs + 1
+                max_len = self._extend_nopfx_graph_max_seqlen
+
+                # Sliding window not supported in this graph mode
+                sliding_window_size = -1
+                window_size = (-1, -1, 0)
+
+                # Extract attention sinks
+                sinks = kwargs.get("sinks", None)
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
+                # Compute cu_seqlens from static extend_seq_lens buffer (graph-safe)
+                cu_seqlens = self.cuda_graph_extend_qo_indptr
+                cu_seqlens[1 : bs + 1] = torch.cumsum(
+                    forward_batch.extend_seq_lens[:bs], dim=0
+                )
+                cu_seqlens_slice = cu_seqlens[:bs0]
+
+                q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+                o_attn = flash_attn_varlen_func(
+                    q_view,
+                    k,
+                    v,
+                    cu_seqlens_slice,
+                    cu_seqlens_slice,  # same as Q — pure self-attention
+                    max_len,
+                    max_len,
+                    min_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    sink_ptr=sink_ptr,
+                )
+                return o_attn.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # ---- CUDA graph-safe extend path (KV cache read) ----
+            # When _extend_graph_mode is True, all metadata is pre-computed in
+            # init_forward_metadata_{capture,replay}_cuda_graph. We skip dynamic
+            # allocations, .item() calls, and CPU-side checks.
+            # NOTE: This path does NOT support SWA layers correctly — the
+            # kv_indices are full pool indices not translated to SWA space.
+            # Currently only activated for non-SWA prefix extends (rare).
+            if self._extend_graph_mode:
+                bs = self._extend_graph_bs
+                bs0 = bs + 1
+
+                # Sliding window not supported in graph mode (rare for gpt-oss)
+                sliding_window_size = -1
+                window_size = (-1, -1)
+
+                # Extract attention sinks
+                sinks = kwargs.get("sinks", None)
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
+                # Use pre-allocated graph buffers (filled during replay_prepare)
+                cu_seqlens_q = self.cuda_graph_extend_qo_indptr[:bs0]
+                all_kv_indptr = self.cuda_graph_extend_kv_indptr[:bs0]
+                all_kv_indices = self.cuda_graph_extend_kv_indices
+                seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+                max_extend_len = self._extend_graph_max_extend_len
+                max_seqlen_k = self._extend_graph_max_seqlen_k
+
+                q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+                if self.kv_cache_dtype == fp8_dtype:
+                    lid = layer.layer_id
+                    total_kv = all_kv_indptr[bs]
+                    idx = all_kv_indices[:total_kv].long()
+                    k_gathered = k_cache[idx].to(torch.bfloat16) * self._fp8_k_scale_per_layer[lid]
+                    v_gathered = v_cache[idx].to(torch.bfloat16) * self._fp8_v_scale_per_layer[lid]
+                    contiguous_indices = torch.arange(
+                        all_kv_indices.shape[0], dtype=torch.int32, device=self.device
+                    )
+                    o_aiter = mha_batch_prefill_func(
+                        q_view, k_gathered, v_gathered,
+                        cu_seqlens_q, all_kv_indptr, contiguous_indices,
+                        max_extend_len, max_seqlen_k,
+                        softmax_scale=layer.scaling,
+                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                        causal=True, window_size=window_size,
+                        seqlen_k=seqlen_k, sink_ptr=sink_ptr,
+                    )
+                else:
+                    o_aiter = mha_batch_prefill_func(
+                        q_view, k_cache, v_cache,
+                        cu_seqlens_q, all_kv_indptr, all_kv_indices,
+                        max_extend_len, max_seqlen_k,
+                        softmax_scale=layer.scaling,
+                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                        causal=True, window_size=window_size,
+                        seqlen_k=seqlen_k, sink_ptr=sink_ptr,
+                    )
+                return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # ---- Original (non-graph) extend path ----
             # Determine sliding window settings
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 sliding_window_size = layer.sliding_window_size
@@ -1657,29 +1903,72 @@ class AiterAttnBackend(AttentionBackend):
 
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
 
-            # Compute kv_indptr and kv_page_indices for ALL tokens (prefix + extend)
-            all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
-            all_kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
-
-            total_kv_len = int(all_kv_indptr[bs].item())
-
-            # mha_batch_prefill reads in chunks of 128 and may overread past
-            # the real data.  Allocate +256 padding and fill the tail with a
-            # valid KV slot so the kernel never hits an illegal address.
-            all_kv_indices = torch.empty(
-                max(total_kv_len, 1) + 256, dtype=torch.int32, device=self.device
+            # For SWA layers, get_kv_buffer returns the SWA pool (smaller than full).
+            # We must use window-limited indices translated to SWA space, otherwise
+            # the kernel reads swa_pool[full_pool_index] → out-of-bounds crash.
+            is_swa_layer = (
+                layer.sliding_window_size is not None
+                and layer.sliding_window_size > -1
             )
-            if total_kv_len > 0:
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    all_kv_indptr,
-                    None,
-                    all_kv_indices,
-                    self.req_to_token.stride(0),
+
+            if is_swa_layer:
+                # SWA layer: only index into the last sliding_window_size tokens
+                swa_size = layer.sliding_window_size
+                swa_size_t = torch.tensor(swa_size, device=self.device)
+                window_kv_lens = torch.minimum(
+                    forward_batch.seq_lens[:bs], swa_size_t
                 )
-                all_kv_indices[total_kv_len:] = all_kv_indices[0]
+                all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+                all_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+                total_kv_len = int(all_kv_indptr[bs].item())
+
+                all_kv_indices = torch.empty(
+                    max(total_kv_len, 1) + 256, dtype=torch.int64, device=self.device
+                )
+                if total_kv_len > 0:
+                    window_kv_start_idx = forward_batch.seq_lens[:bs] - window_kv_lens
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        window_kv_lens,
+                        all_kv_indptr,
+                        window_kv_start_idx,
+                        all_kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                    # Translate full pool indices → SWA pool indices
+                    if hasattr(self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
+                        all_kv_indices[:total_kv_len] = (
+                            self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                                all_kv_indices[:total_kv_len]
+                            )
+                        )
+                    all_kv_indices[total_kv_len:] = all_kv_indices[0]
+                # Convert to int32 for mha_batch_prefill_func
+                all_kv_indices = all_kv_indices.to(torch.int32)
+            else:
+                # Full attention: use all tokens
+                all_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+                all_kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                total_kv_len = int(all_kv_indptr[bs].item())
+
+                # mha_batch_prefill reads in chunks of 128 and may overread past
+                # the real data.  Allocate +256 padding and fill the tail with a
+                # valid KV slot so the kernel never hits an illegal address.
+                all_kv_indices = torch.empty(
+                    max(total_kv_len, 1) + 256, dtype=torch.int32, device=self.device
+                )
+                if total_kv_len > 0:
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        all_kv_indptr,
+                        None,
+                        all_kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                    all_kv_indices[total_kv_len:] = all_kv_indices[0]
 
             seqlen_k = forward_batch.seq_lens[:bs].to(torch.int32)
             max_seqlen_k = max(forward_batch.seq_lens_cpu)

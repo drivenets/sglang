@@ -24,7 +24,6 @@ from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -65,20 +64,11 @@ if _is_cuda or _is_xpu:
         gemma_rmsnorm,
         rmsnorm,
     )
-_has_vllm_rms_norm = False
 if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
-
-    _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
 elif _is_hip:
-    try:
-        from vllm._custom_ops import fused_add_rms_norm, rms_norm
-
-        _has_vllm_rms_norm = True
-    except ImportError:
-        # Fallback: vllm not available, will use forward_native
-        _has_vllm_rms_norm = False
+    from vllm._custom_ops import fused_add_rms_norm, rms_norm
 
 logger = logging.getLogger(__name__)
 
@@ -191,10 +181,6 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Fallback to native implementation if vllm is not available
-        if not _has_vllm_rms_norm:
-            return self.forward_native(x, residual, post_residual_addition)
-
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
@@ -310,31 +296,41 @@ class RMSNorm(MultiPlatformOp):
         if residual is not None:
             from sglang.srt.distributed import (
                 get_tensor_model_parallel_world_size,
-            )
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
+                tensor_model_parallel_all_reduce,
             )
 
             if get_tensor_model_parallel_world_size() > 1:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
 
-                # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-                # Use registered custom op for torch.compile/CUDA graph compat.
                 if _use_aiter:
-                    from sglang.srt.distributed.parallel_state import (
-                        fused_allreduce_rmsnorm_op,
-                        get_tp_group,
+                    from sglang.srt.distributed.parallel_state import get_tp_group
+
+                    pack_size = 16 // x.dtype.itemsize
+                    n_bytes = x.shape[-1] * x.dtype.itemsize
+                    fused_ok = (
+                        x.shape[-1] % pack_size == 0
+                        and 16 <= n_bytes <= 32768
+                    )
+                    if fused_ok:
+                        ca_comm = get_tp_group().ca_comm
+                        if ca_comm is not None:
+                            result = ca_comm.custom_fused_ar_rms(
+                                x,
+                                residual,
+                                self.weight.data,
+                                self.variance_epsilon,
+                            )
+                            if result is not None:
+                                return result
+                    # Fused kernel not applicable; do separate allreduce + layernorm
+                    x = tensor_model_parallel_all_reduce(x)
+                    return self.forward(x, residual)
+                else:
+                    from sglang.srt.layers.flashinfer_comm_fusion import (
+                        flashinfer_allreduce_residual_rmsnorm,
                     )
 
-                    return fused_allreduce_rmsnorm_op(
-                        x,
-                        residual,
-                        self.weight,
-                        self.variance_epsilon,
-                        get_tp_group().unique_name,
-                    )
-                else:
                     fused_result = flashinfer_allreduce_residual_rmsnorm(
                         input_tensor=x,
                         residual=residual,
@@ -345,36 +341,6 @@ class RMSNorm(MultiPlatformOp):
                         return fused_result
 
         return self.forward(x, residual, post_residual_addition)
-
-
-    def forward_with_allreduce_fusion_quant(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Fused AR + RMSNorm + per-group FP8 quantization.
-        Returns (out_fp8, residual) where out_fp8 has _sglang_fp8_group_scales attached."""
-        if residual is not None and _use_aiter:
-            from sglang.srt.distributed.parallel_state import get_tp_group
-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
-
-            if get_tensor_model_parallel_world_size() > 1:
-                tp_group = get_tp_group()
-                ca_comm = tp_group.ca_comm
-                if ca_comm is not None and not getattr(ca_comm, "disabled", True):
-                    if hasattr(ca_comm, "custom_fused_ar_rms_pgquant"):
-                        result = ca_comm.custom_fused_ar_rms_pgquant(
-                            x, residual, self.weight, self.variance_epsilon
-                        )
-                        if result is not None:
-                            out_fp8, residual_out, group_scales = result
-                            # Store scales in thread-local registry keyed by data_ptr
-                            from sglang.srt.layers.quantization.fp8_utils import _fp8_scale_cache
-                            _fp8_scale_cache[out_fp8.data_ptr()] = group_scales
-                            return out_fp8, residual_out
-
-        # Fallback: regular AR+RMSNorm, then separate quant
-        return self.forward_with_allreduce_fusion(x, residual)
 
 
 class LayerNorm(MultiPlatformOp):
@@ -532,8 +498,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get():
-            return self.forward_native(x, residual)
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
