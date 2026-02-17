@@ -1056,7 +1056,7 @@ class Req:
         return False
 
     def check_finished(self, new_accepted_len: int = 1):
-        if self.finished():
+        if self.finished_reason is not None:
             return
 
         if self.to_finish:
@@ -1076,16 +1076,62 @@ class Req:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
-        new_accepted_tokens = self.output_ids[-new_accepted_len:]
+        # Fast path for single-token decode (most common case):
+        # avoid list slice and use the token directly.
+        if new_accepted_len == 1:
+            token_id = self.output_ids[-1]
+            if self._check_single_token_finish(token_id):
+                return
+        else:
+            new_accepted_tokens = self.output_ids[-new_accepted_len:]
+            if self._check_token_based_finish(new_accepted_tokens):
+                return
+            if self._check_vocab_boundary_finish(new_accepted_tokens):
+                return
 
-        if self._check_token_based_finish(new_accepted_tokens):
-            return
+        if (
+            self.sampling_params.stop_strs
+            or self.sampling_params.stop_regex_strs
+        ):
+            if self._check_str_based_finish():
+                return
 
-        if self._check_vocab_boundary_finish(new_accepted_tokens):
-            return
+    def _check_single_token_finish(self, token_id: int) -> bool:
+        """Fast path for checking finish with a single newly accepted token."""
+        # Check vocab boundary
+        if token_id > self.vocab_size or token_id < 0:
+            offset = len(self.output_ids) - 1
+            if self.sampling_params.stop_token_ids:
+                self.output_ids[offset] = next(
+                    iter(self.sampling_params.stop_token_ids)
+                )
+            if self.eos_token_ids:
+                self.output_ids[offset] = next(iter(self.eos_token_ids))
+            self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+            self.finished_len = offset + 1
+            return True
 
-        if self._check_str_based_finish():
-            return
+        # Check stop token ids (inlined for speed)
+        if not self.sampling_params.ignore_eos:
+            if self.sampling_params.stop_token_ids and token_id in self.sampling_params.stop_token_ids:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                self.finished_len = len(self.output_ids)
+                return True
+            if self.eos_token_ids and token_id in self.eos_token_ids:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                self.finished_len = len(self.output_ids)
+                return True
+            if self.tokenizer is not None:
+                if token_id == self.tokenizer.eos_token_id:
+                    self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                    self.finished_len = len(self.output_ids)
+                    return True
+                if self.tokenizer.additional_stop_token_ids and token_id in self.tokenizer.additional_stop_token_ids:
+                    self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                    self.finished_len = len(self.output_ids)
+                    return True
+
+        return False
 
     def reset_for_retract(self):
         # Increment retraction count before resetting other state. We should not reset this

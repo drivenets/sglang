@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
@@ -18,6 +19,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
     BaseFinishReason,
     Req,
     RequestStage,
@@ -26,6 +30,22 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+
+# Try to load the C++ fast decode extension
+_fast_decode_ext = None
+if os.environ.get("SGLANG_FAST_DECODE_CPP", "0") == "1":
+    try:
+        from sglang.srt.managers.build_fast_decode import (
+            cache_request as _cpp_cache_request,
+            uncache_request as _cpp_uncache_request,
+            set_finish_classes as _cpp_set_finish_classes,
+            fast_decode_step as _cpp_fast_decode_step,
+        )
+        _cpp_set_finish_classes(FINISH_LENGTH, FINISH_MATCHED_TOKEN, FINISH_MATCHED_STR)
+        _fast_decode_ext = True
+        logging.getLogger(__name__).info("Fast decode C++ extension loaded")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Fast decode C++ extension not available: {e}")
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -404,115 +424,172 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        if batch.spec_algorithm.is_none():
+        # Hoist invariant checks out of the per-request loop
+        is_no_spec = batch.spec_algorithm.is_none()
+
+        if is_no_spec:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
-        self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        reqs = batch.reqs
+        num_reqs = len(reqs)
+        self.num_generated_tokens += num_reqs
+        if not is_no_spec:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # NOTE: in any case, we should check finish here
-        # if finished, also clean up committed kv cache and over-allocated kv cache here
-
+        # Pre-compute per-batch invariants to avoid repeated attribute lookups
+        enable_overlap = self.enable_overlap
+        has_customized_info = (
+            logits_output is not None
+            and logits_output.customized_info is not None
+        )
+        has_timeout = False
         deadline = -1
-        if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+        timeout_ms = envs.SGLANG_FORWARD_TIMEOUT_MS.get()
+        if timeout_ms > 0:
+            has_timeout = True
             deadline = time.perf_counter() - timeout_ms / 1000.0
+        return_logprob = batch.return_logprob
+        has_hidden_states = (
+            logits_output is not None
+            and logits_output.hidden_states is not None
+        )
+        has_grammar = batch.has_grammar
+        is_spec_v2 = batch.is_spec_v2
+        has_kv_offload = self.server_args.disaggregation_decode_enable_offload_kvcache
+        tree_cache = self.tree_cache
 
-        # Check finish condition
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            req: Req
+        # Fast path: common decode case (no spec, no grammar, no logprob,
+        # no hidden states, no timeout, no customized info)
+        if (
+            is_no_spec
+            and not has_grammar
+            and not return_logprob
+            and not has_hidden_states
+            and not has_timeout
+            and not has_customized_info
+        ):
+            if _fast_decode_ext is not None:
+                # Ensure all requests are cached (no-op if already cached)
+                for req in reqs:
+                    if not getattr(req, '_cpp_cached', False):
+                        _cpp_cache_request(req)
+                        req._cpp_cached = True
 
-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
-                # req.set_finish_with_abort()
-                req.to_finish = FINISH_ABORT(
-                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                # C++ fast path: token append + finish checking in native code
+                finished_indices = _cpp_fast_decode_step(
+                    reqs, next_token_ids, enable_overlap
                 )
+                for idx in finished_indices:
+                    req = reqs[idx]
+                    self.maybe_collect_routed_experts(req)
+                    if has_kv_offload:
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            release_kv_cache(req, tree_cache)
+                    else:
+                        release_kv_cache(req, tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
+                    _cpp_uncache_request(req)
+            else:
+                # Python fast path fallback
+                for i in range(num_reqs):
+                    req = reqs[i]
+                    if enable_overlap and req.finished_reason is not None:
+                        continue
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # (currently not, e.g. Eagle V1 still check finish during forward)
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
+                    req.output_ids.append(next_token_ids[i])
+                    req.check_finished()
 
-            new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
-            elif batch.is_spec_v2:
-                # Only spec v2's output_ids are updated here.
-                req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
+                    if req.finished_reason is not None:
+                        self.maybe_collect_routed_experts(req)
+                        if has_kv_offload:
+                            if not self.decode_offload_manager.offload_kv_cache(req):
+                                release_kv_cache(req, tree_cache)
+                        else:
+                            release_kv_cache(req, tree_cache)
+                        req.time_stats.completion_time = time.perf_counter()
+        else:
+            # General path: handles all features
+            for i in range(num_reqs):
+                req = reqs[i]
 
-            # Update Mamba last track seqlen
-            self._mamba_prefix_cache_update(req, batch, result, i)
-
-            req.check_finished(new_accepted_len)
-
-            if req.finished():
-                self.maybe_collect_routed_experts(req)
-
-                if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                    # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                    if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
-                else:
-                    release_kv_cache(req, self.tree_cache)
-
-                req.time_stats.completion_time = time.perf_counter()
-
-            self.maybe_collect_customized_info(i, req, logits_output)
-
-            if req.return_logprob and batch.spec_algorithm.is_none():
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(
-                        logits_output.next_token_top_logprobs_val[i]
-                    )
-                    req.output_top_logprobs_idx.append(
-                        logits_output.next_token_top_logprobs_idx[i]
-                    )
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
+                if has_timeout and not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                    req.to_finish = FINISH_ABORT(
+                        "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
                     )
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
+                if enable_overlap and (req.finished_reason is not None or req.is_retracted):
+                    continue
 
-            if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                new_accepted_len = 1
+                if is_no_spec:
+                    req.output_ids.append(next_token_ids[i])
+                elif is_spec_v2:
+                    req.output_ids.extend(next_token_ids[i])
+                    new_accepted_len = len(next_token_ids[i])
+
+                if req.mamba_ping_pong_track_buffer is not None:
+                    self._mamba_prefix_cache_update(req, batch, result, i)
+
+                req.check_finished(new_accepted_len)
+
+                if req.finished_reason is not None:
+                    self.maybe_collect_routed_experts(req)
+                    if has_kv_offload:
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            release_kv_cache(req, tree_cache)
+                    else:
+                        release_kv_cache(req, tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
+
+                if has_customized_info:
+                    self.maybe_collect_customized_info(i, req, logits_output)
+
+                if req.return_logprob and is_no_spec:
+                    req.output_token_logprobs_val.append(next_token_logprobs[i])
+                    req.output_token_logprobs_idx.append(next_token_ids[i])
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[i]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[i]
+                        )
+                    if req.token_ids_logprob is not None:
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[i]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[i]
+                        )
+
+                if has_hidden_states and req.return_hidden_states:
+                    req.hidden_states.append(
+                        logits_output.hidden_states[i].cpu().clone().tolist()
                     )
-                    self.abort_request(AbortReq(rid=req.rid))
-                req.grammar.finished = req.finished()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
+                if has_grammar and req.grammar is not None:
+                    try:
+                        if is_no_spec:
+                            req.grammar.accept_token(next_token_ids[i])
+                        elif is_spec_v2:
+                            for token_id in next_token_ids[i]:
+                                req.grammar.accept_token(token_id)
+                    except ValueError as e:
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} with token {next_token_ids[i]}: {e}"
+                        )
+                        self.abort_request(AbortReq(rid=req.rid))
+                    req.grammar.finished = req.finished()
+
+        self.stream_output(batch.reqs, return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -878,6 +955,35 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
+        # Quick pre-scan: check if any request needs output.
+        # For decode batches, most steps have no finished/streaming requests.
+        is_multimodal_gen = self.model_config.is_multimodal_gen
+        has_output = False
+        for req in reqs:
+            if req is skip_req:
+                continue
+            if is_multimodal_gen and req.to_finish:
+                continue
+            if req.finished_reason is not None:
+                if not req.finished_output:
+                    has_output = True
+                    break
+            elif req.stream:
+                has_output = True
+                break
+            elif not is_multimodal_gen and len(req.output_ids) % DEFAULT_FORCE_STREAM_INTERVAL == 0:
+                has_output = True
+                break
+
+        if not has_output and not is_idle_batch:
+            # No request needs output and not idle — skip the expensive list building
+            # Still need to log time stats for finished requests
+            if self.server_args.enable_request_time_stats_logging and self.attn_tp_rank == 0:
+                for req in reqs:
+                    if req.finished_reason is not None:
+                        req.log_time_stats()
+            return
+
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
