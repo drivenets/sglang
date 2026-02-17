@@ -64,6 +64,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -109,6 +110,53 @@ def _aiter_fused_ar_rmsnorm_supported(hidden_size: int, dtype: torch.dtype) -> b
     return hidden_size % pack_size == 0 and 16 <= n_bytes <= 32768
 
 
+def _fused_ar_rmsnorm_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(hidden_states), torch.empty_like(residual)
+
+
+@register_custom_op(
+    fake_impl=_fused_ar_rmsnorm_fake,
+)
+def fused_ar_rmsnorm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Custom op wrapper for aiter's fused allreduce+residual+RMSNorm.
+    Registered as a custom op so dynamo treats it as opaque and doesn't
+    try to trace torch.cuda.is_current_stream_capturing() inside it.
+    """
+    ca_comm = get_tp_group().ca_comm
+    result = ca_comm.custom_fused_ar_rms(
+        hidden_states, residual, weight, eps,
+    )
+    if result is None:
+        # Tensor too large for custom AR; fall back to separate ops
+        from sglang.srt.distributed import tensor_model_parallel_all_reduce
+
+        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        # Use AITER's triton fused add+rmsnorm (sgl_kernel's C++ version
+        # is not available on ROCm -- torch.ops.sgl_kernel.fused_add_rmsnorm
+        # is not registered).
+        from aiter import rmsnorm2d_fwd_with_add
+
+        output = torch.empty_like(hidden_states)
+        residual_out = torch.empty_like(residual)
+        rmsnorm2d_fwd_with_add(
+            output, hidden_states, residual, residual_out, weight, eps
+        )
+        return output, residual_out
+    return result
+
+
 def _try_aiter_fused_ar_rmsnorm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
@@ -131,15 +179,13 @@ def _try_aiter_fused_ar_rmsnorm(
         hidden_states.shape[-1], hidden_states.dtype
     ):
         return None
-    if torch.compiler.is_compiling():
-        return None
-    result = ca_comm.custom_fused_ar_rms(
+    return fused_ar_rmsnorm(
         hidden_states,
         residual,
         layernorm.weight.data,
         layernorm.variance_epsilon,
+        get_tp_group().unique_name,
     )
-    return result
 
 
 class ScatterMode(Enum):

@@ -1107,17 +1107,31 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        _sched_profile_enabled = os.environ.get("SGLANG_SCHED_PROFILE", "0") == "1"
+        _sched_timing_counts = 0
+        _sched_timing_sums = {"recv": 0.0, "get_batch": 0.0, "run_batch": 0.0, "process_result": 0.0, "sample": 0.0, "total_bubble": 0.0}
+        _sched_timing_interval = 500
+
         while True:
+            if _sched_profile_enabled:
+                _t0 = time.perf_counter()
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
+            if _sched_profile_enabled:
+                _t1 = time.perf_counter()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            if _sched_profile_enabled:
+                _t2 = time.perf_counter()
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -1131,6 +1145,9 @@ class Scheduler(
             else:
                 batch_result = None
 
+            if _sched_profile_enabled:
+                _t3 = time.perf_counter()
+
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
@@ -1139,15 +1156,40 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
+            if _sched_profile_enabled:
+                _t4 = time.perf_counter()
+
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
+            if _sched_profile_enabled:
+                _t5 = time.perf_counter()
+
             # Update last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+            if _sched_profile_enabled and batch is not None:
+                _sched_timing_sums["recv"] += (_t1 - _t0)
+                _sched_timing_sums["get_batch"] += (_t2 - _t1)
+                _sched_timing_sums["run_batch"] += (_t3 - _t2)
+                _sched_timing_sums["process_result"] += (_t4 - _t3)
+                _sched_timing_sums["sample"] += (_t5 - _t4)
+                _sched_timing_sums["total_bubble"] += (_t3 - _t0)
+                _sched_timing_counts += 1
+                if _sched_timing_counts % _sched_timing_interval == 0:
+                    logger.info(
+                        f"SCHED_PROFILE [{_sched_timing_counts}] avg per step: "
+                        f"recv={1000*_sched_timing_sums['recv']/_sched_timing_counts:.3f}ms "
+                        f"get_batch={1000*_sched_timing_sums['get_batch']/_sched_timing_counts:.3f}ms "
+                        f"run_batch={1000*_sched_timing_sums['run_batch']/_sched_timing_counts:.3f}ms "
+                        f"process_result={1000*_sched_timing_sums['process_result']/_sched_timing_counts:.3f}ms "
+                        f"sample={1000*_sched_timing_sums['sample']/_sched_timing_counts:.3f}ms "
+                        f"total_bubble={1000*_sched_timing_sums['total_bubble']/_sched_timing_counts:.3f}ms"
+                    )
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.

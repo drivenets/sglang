@@ -305,25 +305,23 @@ class RMSNorm(MultiPlatformOp):
 
                 if _use_aiter:
                     from sglang.srt.distributed.parallel_state import get_tp_group
-
-                    pack_size = 16 // x.dtype.itemsize
-                    n_bytes = x.shape[-1] * x.dtype.itemsize
-                    fused_ok = (
-                        x.shape[-1] % pack_size == 0
-                        and 16 <= n_bytes <= 32768
-                        and not torch.compiler.is_compiling()
+                    from sglang.srt.layers.communicator import (
+                        _aiter_fused_ar_rmsnorm_supported,
+                        fused_ar_rmsnorm,
                     )
-                    if fused_ok:
+
+                    if _aiter_fused_ar_rmsnorm_supported(
+                        x.shape[-1], x.dtype
+                    ):
                         ca_comm = get_tp_group().ca_comm
                         if ca_comm is not None:
-                            result = ca_comm.custom_fused_ar_rms(
+                            return fused_ar_rmsnorm(
                                 x,
                                 residual,
                                 self.weight.data,
                                 self.variance_epsilon,
+                                get_tp_group().unique_name,
                             )
-                            if result is not None:
-                                return result
                     # Fused kernel not applicable; do separate allreduce + layernorm
                     x = tensor_model_parallel_all_reduce(x)
                     return self.forward(x, residual)
