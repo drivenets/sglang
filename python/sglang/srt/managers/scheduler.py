@@ -187,7 +187,6 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.utils import (
     DynamicGradMode,
-    broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -1280,27 +1279,12 @@ class Scheduler(
                 control_reqs = None
 
             if self.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
+                work_reqs = self.attn_tp_group.broadcast_object(work_reqs, src=0)
             if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                control_reqs = self.tp_group.broadcast_object(control_reqs, src=0)
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+            recv_reqs = self.tp_group.broadcast_object(recv_reqs, src=0)
 
         # Process MM requests under EPD-disaggregation mode
         if (
