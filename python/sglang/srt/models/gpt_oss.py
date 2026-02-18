@@ -17,7 +17,7 @@
 
 import logging
 import math
-import re
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -76,37 +76,12 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    is_blackwell_supported,
-    is_cuda,
-    is_flashinfer_available,
-    is_npu,
-    is_sm90_supported,
-    make_layers,
-)
+from sglang.srt.utils import LazyValue, add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
-_is_cuda = is_cuda()
 _is_hip = not _is_cuda and not _is_npu
-_is_tinygemm_supported = (
-    _is_cuda
-    and is_flashinfer_available()
-    and (is_sm90_supported() or is_blackwell_supported())
-)
 
-if _is_tinygemm_supported:
-    try:
-        from flashinfer.gemm import tinygemm_bf16
-    except ImportError:
-        tinygemm_bf16 = None
-        _is_tinygemm_supported = False
-else:
-    tinygemm_bf16 = None
-
-from sglang.srt.compilation.piecewise_context_manager import is_piecewise_capture_active
 from sglang.srt.utils import get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -119,7 +94,6 @@ if _use_fused_rope_cache:
         )
     except ImportError:
         _use_fused_rope_cache = False
-
 
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
@@ -135,45 +109,6 @@ logger = logging.getLogger(__name__)
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
-
-
-class TinyGemmLinear(ReplicatedLinear):
-    """ReplicatedLinear with a FlashInfer tinygemm BF16 fast path."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._use_tinygemm = (
-            _is_tinygemm_supported
-            and not self.skip_bias_add
-            and self.weight.is_contiguous()
-            and self.weight.shape[0] % 16 == 0
-            and self.weight.shape[1] % 64 == 0
-            and self.weight.dtype == torch.bfloat16
-            and (
-                self.bias is None
-                or (
-                    self.bias.dtype == torch.bfloat16
-                    and self.bias.is_contiguous()
-                    and self.bias.shape[0] == self.weight.shape[0]
-                )
-            )
-        )
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if (
-            self._use_tinygemm
-            and x.ndim == 2
-            and x.is_cuda
-            and x.shape[0] <= 128
-            and x.is_contiguous()
-            and x.shape[1] == self.weight.shape[1]
-            and x.dtype == torch.bfloat16
-        ):
-            out = x.new_empty((x.shape[0], self.output_size))
-            tinygemm_bf16(x, self.weight, out, self.bias)
-            return out, None
-
-        return super().forward(x)
 
 
 class GptOssSparseMoeBlock(nn.Module):
@@ -226,7 +161,7 @@ class GptOssSparseMoeBlock(nn.Module):
             **extra_kwargs,
         )
 
-        self.router = TinyGemmLinear(
+        self.router = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=True,
@@ -346,10 +281,9 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
-        attn_backend = get_global_server_args().attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        # Always store sinks as float32: the paged-attention kernel expects float32
+        # sinks, so storing them as bf16 wastes a conversion kernel on every decode step.
+        sinks_dtype = torch.float32
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
@@ -403,22 +337,14 @@ class GptOssAttention(nn.Module):
             # attention layer so aiter_backend can use the fused
             # fused_qk_rope_reshape_and_cache kernel.
             rope = self.rotary_emb
-            cos_sin = rope.cos_sin_cache
-            rot_dim = cos_sin.shape[-1] // 2
-            self.attn._fused_rope_cos = cos_sin[..., :rot_dim]
-            self.attn._fused_rope_sin = cos_sin[..., rot_dim:]
+            self.attn._fused_rope_cos = rope.cos_cache
+            self.attn._fused_rope_sin = rope.sin_cache
             self.attn._fused_rope_is_neox = rope.is_neox_style
             self.attn._fused_rope_positions = positions
             # Don't apply RoPE here -- the backend will do it fused with KV cache write
         else:
             extra_args = {}
-            if not _is_npu:  # sgl_kernel not available on HIP
-                # Skip the fused RoPE+KV-cache kernel during piecewise
-                # CUDA graph capture — torch.compile cannot trace it.
-                _can_fuse = (
-                    enable_fused_set_kv_buffer(forward_batch)
-                    and not is_piecewise_capture_active()
-                )
+            if not _is_npu:
                 extra_args = {
                     "fused_set_kv_buffer_arg": (
                         create_fused_set_kv_buffer_arg(
@@ -426,7 +352,7 @@ class GptOssAttention(nn.Module):
                             layer=self.attn,
                             forward_batch=forward_batch,
                         )
-                        if _can_fuse
+                        if enable_fused_set_kv_buffer(forward_batch)
                         else None
                     ),
                 }
@@ -444,13 +370,6 @@ class GptOssAttention(nn.Module):
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
-        # Flash attention may return (tokens, heads, head_dim) instead of
-        # (tokens, heads * head_dim) during piecewise CUDA graph warmup.
-        # Flatten to 2-D with the correct feature dimension for o_proj.
-        if attn_output.ndim == 3:
-            attn_output = attn_output.reshape(attn_output.shape[0], -1)
-        elif attn_output.shape[-1] != self.q_size:
-            attn_output = attn_output.reshape(-1, self.q_size)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -480,8 +399,8 @@ class GptOssDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
@@ -556,6 +475,9 @@ class GptOssDecoderLayer(nn.Module):
             ),
         )
 
+    _det_debug_store = {}
+    _det_debug_count = 0
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -563,6 +485,16 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if os.environ.get('DET_DEBUG') == '1' and self.layer_id == 0:
+            GptOssDecoderLayer._det_debug_count += 1
+            cnt = GptOssDecoderLayer._det_debug_count
+            n_tok = hidden_states.shape[0]
+            h_sum = hidden_states.float().sum().item()
+            pos_list = positions.tolist() if positions.numel() <= 10 else positions[:10].tolist()
+            res_sum = residual.float().sum().item() if residual is not None else "None"
+            mode = getattr(forward_batch, 'forward_mode', 'unknown')
+            print(f"[DET] FWD#{cnt} L0_input: n_tok={n_tok} h_sum={h_sum:.6f} pos={pos_list} res={res_sum} mode={mode}", flush=True)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -573,6 +505,11 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+        if os.environ.get('DET_DEBUG') == '1' and self.layer_id == 0:
+            cnt = GptOssDecoderLayer._det_debug_count
+            h_sum = hidden_states.float().sum().item()
+            print(f"[DET] FWD#{cnt} L0_after_attn: sum={h_sum:.6f}", flush=True)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -585,6 +522,11 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+
+        if os.environ.get('DET_DEBUG') == '1' and self.layer_id == 0:
+            cnt = GptOssDecoderLayer._det_debug_count
+            h_sum = hidden_states.float().sum().item()
+            print(f"[DET] FWD#{cnt} L0_after_mlp: sum={h_sum:.6f}", flush=True)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -693,13 +635,6 @@ class GptOssModel(nn.Module):
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
-
-    _lora_pattern_moe = re.compile(
-        r"^(?:model\.layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.experts)|lm_head|model\.embed_tokens)$"
-    )
-
-    def should_apply_lora(self, module_name: str) -> bool:
-        return bool(self._lora_pattern_moe.match(module_name))
 
     def __init__(
         self,
