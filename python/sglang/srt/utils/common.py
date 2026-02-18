@@ -1247,6 +1247,18 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+_broadcast_size_tensors: Dict[Any, torch.Tensor] = {}
+
+
+def _get_broadcast_size_tensor(group_key, device):
+    """Get or create a reusable size tensor for a given broadcast group."""
+    if group_key not in _broadcast_size_tensors:
+        _broadcast_size_tensors[group_key] = torch.tensor(
+            [0], dtype=torch.long, device=device
+        )
+    return _broadcast_size_tensors[group_key]
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -1264,9 +1276,12 @@ def broadcast_pyobj(
         else "musa" if is_musa() and not force_cpu_device else "cpu"
     )
 
+    group_key = id(dist_group) if dist_group is not None else "default"
+    tensor_size = _get_broadcast_size_tensor(group_key, device)
+
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            tensor_size.fill_(0)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
             serialized_data = pickle.dumps(data)
@@ -1275,13 +1290,13 @@ def broadcast_pyobj(
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
             ).to(device)
-            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+            tensor_size.fill_(size)
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
         return data
     else:
-        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        tensor_size.fill_(0)
         dist.broadcast(tensor_size, src=src, group=dist_group)
         size = tensor_size.item()
 
