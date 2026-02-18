@@ -17,6 +17,7 @@
 
 import logging
 import math
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -462,6 +463,9 @@ class GptOssDecoderLayer(nn.Module):
             ),
         )
 
+    _det_debug_store = {}
+    _det_debug_count = 0
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -469,6 +473,16 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if os.environ.get('DET_DEBUG') == '1' and self.layer_id == 0:
+            GptOssDecoderLayer._det_debug_count += 1
+            cnt = GptOssDecoderLayer._det_debug_count
+            n_tok = hidden_states.shape[0]
+            h_sum = hidden_states.float().sum().item()
+            pos_list = positions.tolist() if positions.numel() <= 10 else positions[:10].tolist()
+            res_sum = residual.float().sum().item() if residual is not None else "None"
+            mode = getattr(forward_batch, 'forward_mode', 'unknown')
+            print(f"[DET] FWD#{cnt} L0_input: n_tok={n_tok} h_sum={h_sum:.6f} pos={pos_list} res={res_sum} mode={mode}", flush=True)
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -479,6 +493,11 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+        if os.environ.get('DET_DEBUG') == '1' and self.layer_id == 0:
+            cnt = GptOssDecoderLayer._det_debug_count
+            h_sum = hidden_states.float().sum().item()
+            print(f"[DET] FWD#{cnt} L0_after_attn: sum={h_sum:.6f}", flush=True)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -491,6 +510,11 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+
+        if os.environ.get('DET_DEBUG') == '1' and self.layer_id == 0:
+            cnt = GptOssDecoderLayer._det_debug_count
+            h_sum = hidden_states.float().sum().item()
+            print(f"[DET] FWD#{cnt} L0_after_mlp: sum={h_sum:.6f}", flush=True)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
