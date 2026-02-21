@@ -38,11 +38,19 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
+from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     _key_match_paged,
+    compute_node_hash_values,
     get_child_key,
+    split_node_hash_value,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -91,6 +99,7 @@ class TreeNode:
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
         self.swa_uuid = None
+        self.hash_value = None  # For KV event hashing
 
     @property
     def evicted(self):
@@ -366,6 +375,11 @@ class SWARadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         self.sliding_window_size = params.sliding_window_size
+
+        # KV event support (mirrors RadixCache)
+        self.enable_kv_cache_events = params.enable_kv_cache_events
+        self.kv_event_queue = []
+
         self.reset()
 
     ##### Public API #####
@@ -377,6 +391,9 @@ class SWARadixCache(BasePrefixCache):
         return True
 
     def reset(self) -> None:
+        # Record all-cleared event before resetting (skip on first call from __init__)
+        if hasattr(self, 'enable_kv_cache_events'):
+            self._record_all_cleared_event()
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
@@ -389,6 +406,65 @@ class SWARadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
+
+    ##### KV Event Support #####
+
+    def _record_store_event(self, node: TreeNode):
+        """Record BlockStored events for a newly inserted node (one per page_size chunk)."""
+        if not self.enable_kv_cache_events:
+            return
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        parent_block_hash = None
+        if node.parent is not None and node.parent != self.root_node:
+            if node.parent.hash_value is not None and len(node.parent.hash_value) > 0:
+                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                )
+            )
+            parent_block_hash = block_hash
+            page_index += 1
+
+    def _record_remove_event(self, node: TreeNode):
+        """Record BlockRemoved events for an evicted node."""
+        if not self.enable_kv_cache_events:
+            return
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+            self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+            page_index += 1
+
+    def _record_all_cleared_event(self):
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        """Atomically takes all events and clears the queue."""
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -929,6 +1005,12 @@ class SWARadixCache(BasePrefixCache):
         if not new_node.swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_lru_list.insert_mru(child)
+
+        # Propagate hash_value to split nodes for KV event tracking
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
+
         return new_node
 
     def _insert_helper(
@@ -1052,6 +1134,9 @@ class SWARadixCache(BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
+        # Record KV event for new node (regardless of tombstone status,
+        # since the full attention KV cache is populated for all nodes)
+        self._record_store_event(new_node)
         return new_node
 
     def _iteratively_delete_tombstone_leaf(
@@ -1082,6 +1167,7 @@ class SWARadixCache(BasePrefixCache):
             not node.swa_tombstone
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
+        self._record_remove_event(node)
         key = self.get_child_key_fn(node.key)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
@@ -1098,6 +1184,7 @@ class SWARadixCache(BasePrefixCache):
             node.swa_tombstone
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
+        self._record_remove_event(node)
         key = self.get_child_key_fn(node.key)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"

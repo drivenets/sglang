@@ -2060,10 +2060,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Capture EXTEND (prefill) CUDA graphs — whole-model graphs for
         # extend_no_prefix batches. Eliminates ~17ms kernel launch overhead.
         self.extend_graph_runner = None
+        is_decode_only = getattr(self.server_args, "disaggregation_mode", None) == "decode"
         if (
             self.device not in ("cpu", "npu")
             and not self.server_args.disable_cuda_graph
             and not self.server_args.enable_mixed_chunk  # Only for non-mixed mode
+            and not is_decode_only
         ):
             try:
                 extend_before = get_available_gpu_memory(self.device, self.gpu_id)

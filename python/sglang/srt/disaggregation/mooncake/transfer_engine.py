@@ -178,10 +178,13 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            transport = os.environ.get("SGLANG_MOONCAKE_TRANSPORT", "rdma")
+            if transport == "hip":
+                logger.info("Using Mooncake HIP (GPU IPC) transport for KV transfer")
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                transport,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:

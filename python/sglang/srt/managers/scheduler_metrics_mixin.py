@@ -526,6 +526,15 @@ class SchedulerMetricsMixin:
 
         events = self.tree_cache.take_events()
         if events:
+            if not hasattr(self, '_kv_event_log_count'):
+                self._kv_event_log_count = 0
+            self._kv_event_log_count += 1
+            if self._kv_event_log_count <= 5 or self._kv_event_log_count % 500 == 0:
+                logger.info(
+                    "KV events: publishing batch #%d with %d events",
+                    self._kv_event_log_count,
+                    len(events),
+                )
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
