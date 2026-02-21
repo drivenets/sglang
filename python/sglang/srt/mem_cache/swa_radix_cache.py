@@ -30,24 +30,26 @@ from numpy import float64
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    DecLockRefParams,
-    DecLockRefResult,
     EvictParams,
     EvictResult,
-    IncLockRefResult,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
+from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     _key_match_paged,
+    compute_node_hash_values,
     get_child_key,
-    maybe_bigram_convert,
-    page_align_keys,
     split_node_hash_value,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -97,6 +99,7 @@ class TreeNode:
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
         self.swa_uuid = None
+        self.hash_value = None  # For KV event hashing
 
     @property
     def evicted(self):
@@ -328,10 +331,10 @@ class LRUList:
 
             if self.is_swa_list:
                 evictable_size = tree_cache.swa_evictable_size()
-                lru_list_evictable_size = self.sanity_check_evictable_size()
+                lru_list_evictable_size = tree_cache.swa_lru_list_evictable_size()
             else:
                 evictable_size = tree_cache.full_evictable_size()
-                lru_list_evictable_size = self.sanity_check_evictable_size()
+                lru_list_evictable_size = tree_cache.full_lru_list_evictable_size()
 
             assert (
                 evictable_size == lru_list_evictable_size
@@ -372,6 +375,11 @@ class SWARadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         self.sliding_window_size = params.sliding_window_size
+
+        # KV event support (mirrors RadixCache)
+        self.enable_kv_cache_events = params.enable_kv_cache_events
+        self.kv_event_queue = []
+
         self.reset()
 
     ##### Public API #####
@@ -383,6 +391,9 @@ class SWARadixCache(BasePrefixCache):
         return True
 
     def reset(self) -> None:
+        # Record all-cleared event before resetting (skip on first call from __init__)
+        if hasattr(self, 'enable_kv_cache_events'):
+            self._record_all_cleared_event()
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
@@ -396,6 +407,65 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
 
+    ##### KV Event Support #####
+
+    def _record_store_event(self, node: TreeNode):
+        """Record BlockStored events for a newly inserted node (one per page_size chunk)."""
+        if not self.enable_kv_cache_events:
+            return
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        parent_block_hash = None
+        if node.parent is not None and node.parent != self.root_node:
+            if node.parent.hash_value is not None and len(node.parent.hash_value) > 0:
+                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                )
+            )
+            parent_block_hash = block_hash
+            page_index += 1
+
+    def _record_remove_event(self, node: TreeNode):
+        """Record BlockRemoved events for an evicted node."""
+        if not self.enable_kv_cache_events:
+            return
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+            self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+            page_index += 1
+
+    def _record_all_cleared_event(self):
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        """Atomically takes all events and clears the queue."""
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
@@ -407,9 +477,10 @@ class SWARadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
+        key = params.key
+        key.token_ids = self.key_convert_fn(key.token_ids)
 
-        key = self._match_pre_processor(params)
-        if key is None:
+        if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=torch.empty(
                     (0,),
@@ -420,8 +491,20 @@ class SWARadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
-        value, last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, last_node, best_value_len)
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
+
+        value, last_node = self._match_prefix_helper(key)
+        if value:
+            value = torch.cat(value)
+        else:
+            value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+        )
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -432,10 +515,14 @@ class SWARadixCache(BasePrefixCache):
         prev_prefix_len = params.prev_prefix_len
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
+        key.token_ids = self.key_convert_fn(key.token_ids)
+
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
 
-        key, value = maybe_bigram_convert(self.is_eagle, key, value)
+        if self.is_eagle:
+            # Make sure the value len equal to the EAGLE bigram key len
+            value = value[: len(key)]
 
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
@@ -453,29 +540,40 @@ class SWARadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
+        actual_kv_len = kv_committed_len - 1 if self.is_eagle else kv_committed_len
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = self.key_convert_fn(token_ids)
-        keys = page_align_keys(keys, self.page_size)
-        page_aligned_len = len(keys)
-        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(
-            keys[:page_aligned_len],
-            req.extra_key,
-            is_bigram=self.is_eagle,
+        if self.page_size != 1:
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = actual_kv_len
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        page_aligned_token_len = (
+            page_aligned_len + 1 if self.is_eagle else page_aligned_len
         )
-        old_prefix_len = req.cache_protected_len
+
+        old_prefix_len = len(req.prefix_indices)
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
+            old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
+        # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
         if is_insert:
             self.insert(
                 InsertParams(
-                    key=radix_key,
-                    value=values,
+                    key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                    value=page_aligned_kv_indices,
                     prev_prefix_len=old_prefix_len,
                     swa_evicted_seqlen=req.swa_evicted_seqlen,
                 )
@@ -489,9 +587,7 @@ class SWARadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
-        self.dec_lock_ref(
-            req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
-        )
+        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -505,35 +601,58 @@ class SWARadixCache(BasePrefixCache):
             return
 
         token_ids = req.fill_ids
+        all_token_len = len(token_ids)
+        # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
+        # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
+        actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :all_token_len
         ]
 
-        keys = self.key_convert_fn(token_ids)
-        keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
-        old_prefix_len = req.cache_protected_len
+        if self.page_size != 1:
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+                dtype=torch.int64, copy=True
+            )
+        else:
+            page_aligned_len = actual_kv_len
+            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
+        page_aligned_token_len = (
+            page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        )
+        page_aligned_token_ids = token_ids[:page_aligned_token_len]
+
+        old_prefix_len = len(req.prefix_indices)
+        if self.is_eagle and old_prefix_len > req.cache_protected_len:
+            # In EAGLE chunked prefill case, the prefix_indices included one unmatched token (kv_indices[actual_kv_len:])
+            # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
+            old_prefix_len -= 1
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
             InsertParams(
-                key=radix_key,
-                value=values,
+                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                value=page_aligned_kv_indices,
                 prev_prefix_len=old_prefix_len,
             )
         )
         new_prefix_len = result.prefix_len
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
-        new_indices, new_last_node = (
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+        )
+        (new_indices, new_last_node) = (
             match_result.device_indices,
             match_result.last_device_node,
         )
 
-        assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
+        assert old_prefix_len <= len(
+            new_indices
+        ), f"{req.prefix_indices=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
@@ -542,19 +661,22 @@ class SWARadixCache(BasePrefixCache):
 
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(
-            req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
-        )
-        result = self.inc_lock_ref(new_last_node)
-        swa_uuid_for_lock = result.swa_uuid_for_lock
+        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        if len(new_indices) < len(kv_indices):
+        if self.page_size != 1:
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
             )
         else:
-            req.prefix_indices = new_indices
+            if self.is_eagle:
+                # Attach the kv index of the last token for EAGLE, it can be used in chunked prefill
+                req.prefix_indices = torch.cat(
+                    [new_indices, kv_indices[actual_kv_len:]]
+                )
+            else:
+                req.prefix_indices = new_indices
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
 
@@ -656,7 +778,7 @@ class SWARadixCache(BasePrefixCache):
             num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
         )
 
-    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+    def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
         """
         Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs
         to be passed to dec_lock_ref.
@@ -664,7 +786,7 @@ class SWARadixCache(BasePrefixCache):
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         """
         if self.disable:
-            return IncLockRefResult()
+            return None
 
         swa_lock_size = 0
         swa_uuid_for_lock = None
@@ -695,21 +817,17 @@ class SWARadixCache(BasePrefixCache):
                         node.swa_uuid = gen_swa_uuid()
                     swa_uuid_for_lock = node.swa_uuid
             node = node.parent
-        return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
+        return swa_uuid_for_lock
 
-    def dec_lock_ref(
-        self, node: TreeNode, params: Optional[DecLockRefParams] = None
-    ) -> DecLockRefResult:
+    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None):
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
         It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
         """
-        swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
-
         if self.disable:
-            return DecLockRefResult()
+            return
 
         dec_lock_swa = True
         while node != self.root_node:
@@ -738,8 +856,6 @@ class SWARadixCache(BasePrefixCache):
 
             node = node.parent
 
-        return DecLockRefResult()
-
     def sanity_check(self):
         self.full_lru_list.sanity_check(self)
         self.swa_lru_list.sanity_check(self)
@@ -753,6 +869,14 @@ class SWARadixCache(BasePrefixCache):
 
     def swa_evictable_size(self) -> int:
         return self.swa_evictable_size_
+
+    # Note: this is expensive, only use for debug
+    def full_lru_list_evictable_size(self) -> int:
+        return self.full_lru_list.sanity_check_evictable_size()
+
+    # Note: this is expensive, only use for debug
+    def swa_lru_list_evictable_size(self) -> int:
+        return self.swa_lru_list.sanity_check_evictable_size()
 
     def protected_size(self) -> Tuple[int, int]:
         # Note: use full_protected_size() and swa_protected_size() instead.
@@ -777,23 +901,11 @@ class SWARadixCache(BasePrefixCache):
         _dfs_helper(self.root_node)
         return torch.cat(values)
 
-    def available_and_evictable_str(self) -> str:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        full_evictable_size = self.full_evictable_size()
-        swa_evictable_size = self.swa_evictable_size()
-        return (
-            f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-            f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            f"Full LRU list evictable size: {self.full_lru_list.sanity_check_evictable_size()}\n"
-            f"SWA LRU list evictable size: {self.swa_lru_list.sanity_check_evictable_size()}\n"
-        )
-
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
+    ) -> Tuple[List[torch.Tensor], TreeNode]:
         """
         SWA prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without swa tombstone,
@@ -842,33 +954,9 @@ class SWARadixCache(BasePrefixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        return value, best_last_node, best_value_len
-
-    def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
-        """Preprocess the key before matching."""
-        key = params.key
-        key, _ = maybe_bigram_convert(self.is_eagle, key)
-
-        if self.disable or len(key) == 0:
-            return None
-
-        if self.page_size != 1:
-            page_aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:page_aligned_len]
-
-        return key
-
-    def _match_post_processor(
-        self,
-        params: MatchPrefixParams,
-        value: List[torch.Tensor],
-        last_node: TreeNode,
-        best_value_len: int,
-    ) -> MatchResult:
-        """Post-process the matched result."""
-        node_update = last_node
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows swa to evict nodes closer to root first
+        node_update = best_last_node
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
         self.swa_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
@@ -881,17 +969,7 @@ class SWARadixCache(BasePrefixCache):
             )
             node_update = node_update.parent
 
-        value = value[:best_value_len]
-        if value:
-            value = torch.cat(value)
-        else:
-            value = torch.empty((0,), dtype=torch.int64, device=self.device)
-
-        return MatchResult(
-            device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
-        )
+        return value[:best_value_len], best_last_node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
@@ -927,6 +1005,12 @@ class SWARadixCache(BasePrefixCache):
         if not new_node.swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_lru_list.insert_mru(child)
+
+        # Propagate hash_value to split nodes for KV event tracking
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
+
         return new_node
 
     def _insert_helper(
@@ -1050,6 +1134,9 @@ class SWARadixCache(BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
+        # Record KV event for new node (regardless of tombstone status,
+        # since the full attention KV cache is populated for all nodes)
+        self._record_store_event(new_node)
         return new_node
 
     def _iteratively_delete_tombstone_leaf(
@@ -1080,6 +1167,7 @@ class SWARadixCache(BasePrefixCache):
             not node.swa_tombstone
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
+        self._record_remove_event(node)
         key = self.get_child_key_fn(node.key)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
@@ -1096,6 +1184,7 @@ class SWARadixCache(BasePrefixCache):
             node.swa_tombstone
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
+        self._record_remove_event(node)
         key = self.get_child_key_fn(node.key)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
