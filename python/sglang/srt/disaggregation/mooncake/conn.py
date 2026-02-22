@@ -817,10 +817,15 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        src_data_ptrs: Optional[list[int]] = None,
+        src_item_len: Optional[int] = None,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
         supporting generic M-to-N TP size configurations.
+
+        When src_data_ptrs/src_item_len are provided, operates on the given
+        data pool (e.g. SWA state pool) instead of the default KV pool.
 
         NOTE: This implementation calls the transfer engine for each token slot within
         each page to ensure correctness for any page_size and head-slicing configuration.
@@ -828,7 +833,7 @@ class MooncakeKVManager(CommonKVManager):
         """
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
-        src_kv_item_len = self.kv_args.kv_item_lens[0]
+        src_kv_item_len = src_item_len if src_item_len is not None else self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
@@ -864,8 +869,9 @@ class MooncakeKVManager(CommonKVManager):
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
 
+        effective_src_ptrs = src_data_ptrs if src_data_ptrs is not None else self.kv_args.kv_data_ptrs
         src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-            self.get_mha_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
+            self.get_mha_kv_ptrs_with_pp(effective_src_ptrs, dst_kv_ptrs)
         )
 
         # Calculate precise byte offset and length for the sub-slice within the token
@@ -1055,14 +1061,24 @@ class MooncakeKVManager(CommonKVManager):
                     dst_state_data_ptrs,
                 )
         elif state_type in ["swa", "nsa"]:
-            # SWA and NSA hybrid models do not support different TP sizes yet
+            prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
+            dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
             if (
                 target_rank_registration_info is not None
                 and not self.is_mla_backend
                 and self.attn_tp_size != target_rank_registration_info.dst_attn_tp_size
             ):
-                raise RuntimeError(
-                    f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {state_type.upper()} hybrid models yet."
+                return self.send_kvcache_slice(
+                    mooncake_session_id=req.mooncake_session_id,
+                    prefill_kv_indices=prefill_state_indices,
+                    dst_kv_ptrs=dst_state_data_ptrs,
+                    dst_kv_indices=dst_state_indices,
+                    dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                    dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                    dst_kv_item_len=target_rank_registration_info.dst_state_item_lens[0],
+                    executor=executor,
+                    src_data_ptrs=self.kv_args.state_data_ptrs,
+                    src_item_len=self.kv_args.state_item_lens[0],
                 )
             if len(prefill_state_indices) < len(req.dst_state_indices):
                 logger.warning(
