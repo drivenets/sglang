@@ -1159,7 +1159,68 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     )
                     # Keep as int64 to match Triton's expectation
-                
+
+                # --- Precompute KV indices for forward_extend (cached across all layers) ---
+                bs0 = bs + 1
+
+                # Full-attention indices: cumsum of seq_lens
+                seq_lens_local = forward_batch.seq_lens[:bs].to(self.device)
+                extend_full_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+                extend_full_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_local, dim=0)
+                extend_full_total_kv_len = int(extend_full_kv_indptr[bs].item())
+
+                extend_full_kv_indices = torch.empty(
+                    max(extend_full_total_kv_len, 1) + 256, dtype=torch.int32, device=self.device
+                )
+                if extend_full_total_kv_len > 0:
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        forward_batch.req_pool_indices,
+                        seq_lens_local,
+                        extend_full_kv_indptr,
+                        None,
+                        extend_full_kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                    extend_full_kv_indices[extend_full_total_kv_len:] = extend_full_kv_indices[0]
+
+                # SWA indices: window-limited, translated to SWA pool space
+                extend_swa_kv_indptr = None
+                extend_swa_kv_indices = None
+                extend_swa_total_kv_len = 0
+                if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                    swa_size = self.sliding_window_size
+                    swa_size_t = torch.tensor(swa_size, device=self.device)
+                    window_kv_lens = torch.minimum(seq_lens_local, swa_size_t)
+                    extend_swa_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+                    extend_swa_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+                    extend_swa_total_kv_len = int(extend_swa_kv_indptr[bs].item())
+
+                    extend_swa_kv_indices = torch.empty(
+                        max(extend_swa_total_kv_len, 1) + 256, dtype=torch.int64, device=self.device
+                    )
+                    if extend_swa_total_kv_len > 0:
+                        swa_window_kv_start_idx = seq_lens_local - window_kv_lens
+                        create_flashinfer_kv_indices_triton[(bs,)](
+                            self.req_to_token,
+                            forward_batch.req_pool_indices,
+                            window_kv_lens,
+                            extend_swa_kv_indptr,
+                            swa_window_kv_start_idx,
+                            extend_swa_kv_indices,
+                            self.req_to_token.stride(0),
+                        )
+                        # Translate full pool indices → SWA pool indices
+                        if hasattr(self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
+                            extend_swa_kv_indices[:extend_swa_total_kv_len] = (
+                                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                                    extend_swa_kv_indices[:extend_swa_total_kv_len]
+                                )
+                            )
+                        extend_swa_kv_indices[extend_swa_total_kv_len:] = extend_swa_kv_indices[0]
+                    # Convert to int32 for mha_batch_prefill_func
+                    extend_swa_kv_indices = extend_swa_kv_indices.to(torch.int32)
+
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -1170,6 +1231,12 @@ class AiterAttnBackend(AttentionBackend):
                     window_kv_indptr=window_kv_indptr,
                     window_kv_indices=window_kv_indices,
                     window_kv_start_idx=None,  # Not used for extend
+                    extend_full_kv_indptr=extend_full_kv_indptr,
+                    extend_full_kv_indices=extend_full_kv_indices,
+                    extend_full_total_kv_len=extend_full_total_kv_len,
+                    extend_swa_kv_indptr=extend_swa_kv_indptr,
+                    extend_swa_kv_indices=extend_swa_kv_indices,
+                    extend_swa_total_kv_len=extend_swa_total_kv_len,
                 )
 
     def init_cuda_graph_state(
