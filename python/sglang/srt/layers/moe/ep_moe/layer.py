@@ -808,6 +808,15 @@ class MoriEPMoE(DeepEPMoE):
                 quant_type = QuantType.per_128x128
 
         # [KK TODO] should to call the apply of quant method to handle fused moe
+        # For MXFP4 with fused gate+up (w13), use Swiglu activation which matches
+        # the non-EP AITER path and avoids incompatible moe_mxfp4_sort code path
+        if is_mxfp4:
+            activation = ActivationType.Swiglu
+        elif self.moe_runner_config.activation == "silu":
+            activation = ActivationType.Silu
+        else:
+            activation = ActivationType.Gelu
+
         hidden_states = fused_moe(
             hidden_states=dispatch_a1,
             w1=w13_weight,
@@ -818,14 +827,12 @@ class MoriEPMoE(DeepEPMoE):
             topk_weight=dispatch_weights,
             topk_ids=dispatch_ids,
             quant_type=quant_type,
-            activation=(
-                ActivationType.Silu
-                if self.moe_runner_config.activation == "silu"
-                else ActivationType.Gelu
-            ),
+            activation=activation,
             expert_mask=self.expert_mask,
             num_local_tokens=dispatch_recv_token_num,
             dtype=output_dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
         )
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

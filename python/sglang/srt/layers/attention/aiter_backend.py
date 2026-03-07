@@ -253,6 +253,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.logits_soft_cap = 0.0
 
+
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
@@ -2785,6 +2786,15 @@ class AiterAttnBackend(AttentionBackend):
         sinks=None,
     ):
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+
+        num_tokens = q.shape[0]
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty(
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+        else:
+            o = torch.empty_like(q, dtype=self.input_dtype)
 
         k_descale = None
         v_descale = None

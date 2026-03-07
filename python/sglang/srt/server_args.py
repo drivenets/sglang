@@ -2715,6 +2715,13 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
+                # Re-enable the AMD auto-reduce of mem_fraction_static. The
+                # TBO upstream commit (e3605a665) disabled this for "fair
+                # comparison with vLLM", but in our 1P1D mooncake setup the
+                # extra memory collides with RDMA-registered KV buffers and
+                # the cross-node handshake fails. Keep auto-reduce so PD
+                # disagg works; benchmarkers can override --mem-fraction-static
+                # explicitly if they want a tighter bound.
                 self.mem_fraction_static *= 0.85
 
         # Other platforms backends
@@ -7047,10 +7054,8 @@ class ServerArgs:
             )
 
         # Check two batch overlap
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
-            raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
-            )
+        # Note: TBO with moe_a2a_backend='none' is allowed for TP-only models
+        # (e.g., GPT-OSS) that use async AllReduce for compute-comm overlap.
 
         if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
             raise ValueError(

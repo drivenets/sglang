@@ -74,7 +74,11 @@ def get_token_num_per_seq(
         return None
 
 
-# TODO: may smartly disable TBO when batch size is too small b/c it will slow down
+# Returns None when the batch can't be meaningfully two-way-split (caller treats
+# None as "TBO disabled for this step" and runs the standard non-TBO path).
+# A degenerate split where one micro-batch ends up with 0 tokens / 0 seqs
+# produces empty tensors that silently kill kernels with grid_x=0 in
+# hipModuleLaunchKernel — see PD-disagg warmup crash on bs=1 EXTEND.
 def compute_split_seq_index(
     forward_mode: ForwardMode,
     num_tokens: int,
@@ -83,10 +87,22 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
-        return _split_extend_seqs(extend_lens)
+        if len(extend_lens) < 2:
+            return None
+        idx = _split_extend_seqs(extend_lens)
+        # Reject splits that put 0 seqs on either side, or 0 tokens (one seq
+        # straddling the boundary in chunked prefill could hit this).
+        if idx <= 0 or idx >= len(extend_lens):
+            return None
+        if sum(extend_lens[:idx]) == 0 or sum(extend_lens[idx:]) == 0:
+            return None
+        return idx
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
-        return (num_tokens // token_num_per_seq) // 2
+        num_seqs = num_tokens // token_num_per_seq
+        if num_seqs < 2:
+            return None
+        return num_seqs // 2
     elif forward_mode.is_idle() or forward_mode.is_prebuilt():
         assert num_tokens == 0
         return 0
@@ -331,8 +347,11 @@ class TboCudaGraphRunnerPlugin:
             extend_lens=None,
             token_num_per_seq=token_num_per_seq,
         )
-        # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
-        assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
+        # If the batch can't be meaningfully split (e.g. bs=1 decode), skip
+        # the TBO-flavoured capture for this size — the runtime replay will
+        # also see split=None and dispatch to the standard non-TBO path.
+        if batch.tbo_split_seq_index is None:
+            return
 
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
@@ -641,6 +660,22 @@ class TboForwardBatchPreparer:
                 old_value.shape[0] == num_tokens
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
             output_dict[key] = old_value[start_token_index:end_token_index]
+
+        # Per-token SWA-pool slot indices. Hybrid-SWA models (e.g. GPT-OSS)
+        # populate this so SWA layers can write to a separate KV pool. It has
+        # the same shape and indexing as `out_cache_loc`, so it splits the
+        # same way. Without this, TBO crashes for any hybrid-SWA model with
+        # "Field out_cache_loc_swa has value, but is not yet supported".
+        if batch.out_cache_loc_swa is not None:
+            old_value = batch.out_cache_loc_swa
+            assert (
+                old_value.shape[0] == num_tokens
+            ), f"out_cache_loc_swa {old_value=} {num_tokens=} {batch=}"
+            output_dict["out_cache_loc_swa"] = old_value[
+                start_token_index:end_token_index
+            ]
+        else:
+            output_dict["out_cache_loc_swa"] = None
 
         attention_tp_size = get_attention_tp_size()
         output_dict["tbo_padded_len"] = (

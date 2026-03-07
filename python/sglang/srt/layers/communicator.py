@@ -744,7 +744,7 @@ class LayerCommunicator:
             else 0
         )
 
-        if (
+        return (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
