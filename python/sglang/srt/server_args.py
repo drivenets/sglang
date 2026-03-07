@@ -2414,7 +2414,9 @@ class ServerArgs:
         # AMD platforms backends
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
-                self.mem_fraction_static *= 0.85
+                # NOTE: auto-reduce disabled for fair comparison with vLLM
+                # self.mem_fraction_static *= 0.85
+                pass
 
         # Other platforms backends
         if (
@@ -6224,10 +6226,8 @@ class ServerArgs:
             )
 
         # Check two batch overlap
-        if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
-            raise ValueError(
-                "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
-            )
+        # Note: TBO with moe_a2a_backend='none' is allowed for TP-only models
+        # (e.g., GPT-OSS) that use async AllReduce for compute-comm overlap.
 
         if self.gc_threshold:
             if not (1 <= len(self.gc_threshold) <= 3):

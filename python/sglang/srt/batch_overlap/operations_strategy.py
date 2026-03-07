@@ -63,6 +63,15 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif layer_name == "GptOssDecoderLayer":
+            return OperationsStrategy.concat(
+                [
+                    _compute_moe_gptoss_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in layers
+                ]
+            )
         else:
             raise NotImplementedError
 
@@ -298,5 +307,72 @@ def _compute_moe_mimov2_decode(layer):
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
             operations.YieldOperation(),
+        ],
+    )
+
+
+# -------------------------------- Strategy for GPT-OSS ---------------------------------------
+# GPT-OSS uses TP with AllReduce (not EP with dispatch/combine).
+# Overlap is achieved by launching AllReduce on a dedicated NCCL stream
+# and interleaving the other sub-batch's compute during the AllReduce.
+# 5 stages per layer with delta_stages=1:
+#   S0: [attn_compute + launch_attn_AR]     -- launch AR at end of compute
+#   S1: [wait_attn_AR + norm + MoE_no_ar]   -- wait AR (hidden behind other batch's S0)
+#   S2: [launch_MoE_AR]                     -- launch AR
+#   S3: [wait_MoE_AR + postprocess]         -- wait AR (hidden behind other batch's S1)
+#   Across layer boundaries: B.L(i).S3's MoE_AR overlaps with A.L(i+1).S0's attn compute.
+
+
+def _compute_moe_gptoss_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    assert layer.is_layer_sparse, "GPT-OSS TBO only supports sparse layers"
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_moe_gptoss_prefill(layer)
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        return _compute_moe_gptoss_decode(layer)
+    else:
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_moe_gptoss_prefill(layer):
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=1,
+        operations=[
+            # Stage 0: Attention compute + launch async AllReduce
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_launch_attn_ar,
+            operations.YieldOperation(),
+            # Stage 1: Wait AllReduce + norm + MoE (no AllReduce inside MoE)
+            layer.op_wait_attn_ar_and_norm,
+            layer.op_mlp_no_ar,
+            operations.YieldOperation(),
+            # Stage 2: Launch MoE AllReduce
+            layer.op_launch_mlp_ar,
+            operations.YieldOperation(),
+            # Stage 3: Wait MoE AllReduce + postprocess
+            layer.op_wait_mlp_ar_and_post,
+        ],
+    )
+
+
+def _compute_moe_gptoss_decode(layer):
+    # For decode, use synchronous path (no async AR needed, decode is fast)
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_comm_prepare_mlp,
+            layer.op_mlp_with_ar,
+            layer.op_comm_postprocess_layer,
         ],
     )

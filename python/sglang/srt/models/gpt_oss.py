@@ -82,6 +82,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_npu = is_npu()
 _is_hip = not _is_cuda and not _is_npu
 
+import torch.distributed as dist
 from sglang.srt.utils import get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -103,6 +104,43 @@ class GptOssConfig(PretrainedConfig):
 
 
 logger = logging.getLogger(__name__)
+
+
+class _AsyncAllReduce:
+    """Launch NCCL AllReduce on a dedicated CUDA stream for compute-comm overlap.
+
+    Used by TBO (Two-Batch Overlap) to hide AllReduce latency behind the other
+    sub-batch's compute on the default stream. The AllReduce runs on a separate
+    stream so GPU compute can proceed in parallel.
+    """
+
+    _stream = None
+    _event = None
+    _group = None
+
+    @classmethod
+    def _ensure_init(cls):
+        if cls._stream is None:
+            cls._stream = torch.cuda.Stream()
+            cls._event = torch.cuda.Event()
+            from sglang.srt.distributed import get_tp_group
+
+            cls._group = get_tp_group().device_group
+
+    @classmethod
+    def launch(cls, tensor):
+        """Launch in-place AllReduce on NCCL stream. Returns immediately on default stream."""
+        cls._ensure_init()
+        default_stream = torch.cuda.current_stream()
+        cls._stream.wait_stream(default_stream)
+        with torch.cuda.stream(cls._stream):
+            dist.all_reduce(tensor, group=cls._group)
+            cls._event.record()
+
+    @classmethod
+    def wait(cls):
+        """Block default stream until the AllReduce on NCCL stream completes."""
+        torch.cuda.current_stream().wait_event(cls._event)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -361,7 +399,7 @@ class GptOssAttention(nn.Module):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
-    def forward_core(self, intermediate_state):
+    def forward_core(self, intermediate_state, skip_all_reduce=False):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
@@ -370,7 +408,7 @@ class GptOssAttention(nn.Module):
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
         return output
 
     def forward(
@@ -385,6 +423,20 @@ class GptOssAttention(nn.Module):
             forward_batch=forward_batch,
         )
         return self.forward_core(s)
+
+    # ---- TBO ops ----
+    def op_prepare(self, state):
+        state.attn_intermediate_state = self.forward_prepare(
+            positions=state.positions,
+            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            forward_batch=state.forward_batch,
+        )
+
+    def op_core(self, state):
+        # skip_all_reduce=True: TBO handles allreduce via op_launch_attn_ar
+        state.hidden_states_after_attn = self.forward_core(
+            state.pop("attn_intermediate_state"), skip_all_reduce=True
+        )
 
 
 class GptOssDecoderLayer(nn.Module):
@@ -538,6 +590,122 @@ class GptOssDecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    # ---- TBO ops: communicator wrappers ----
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions,
+        hidden_states,
+        forward_batch,
+        residual,
+        tbo_subbatch_index=None,
+        **kwargs,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual = (
+            self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_comm_prepare_mlp(self, state):
+        """Synchronous AllReduce + post_attention_layernorm. Used for decode TBO."""
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual"),
+                state.forward_batch,
+            )
+        )
+
+    def op_comm_postprocess_layer(self, state):
+        """Synchronous postprocess. Used for decode TBO."""
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(
+            expect_keys={"positions", "forward_batch", "tbo_subbatch_index"}
+        )
+        return output
+
+    # ---- TBO ops: async AllReduce for prefill ----
+    def op_launch_attn_ar(self, state):
+        """Launch async AllReduce for attention output on NCCL stream."""
+        hidden_states = state.pop("hidden_states_after_attn")
+        if self.attn_tp_size > 1 and hidden_states.shape[0] > 0:
+            _AsyncAllReduce.launch(hidden_states)
+        state.hidden_states_ar_pending = hidden_states
+
+    def op_wait_attn_ar_and_norm(self, state):
+        """Wait for attn AllReduce, then apply post_attention_layernorm + residual."""
+        if self.attn_tp_size > 1 and state.hidden_states_ar_pending.shape[0] > 0:
+            _AsyncAllReduce.wait()
+        hidden_states = state.pop("hidden_states_ar_pending")
+        residual = state.pop("residual")
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+        state.hidden_states_mlp_input = hidden_states
+        state.residual_after_norm = residual
+
+    def op_mlp_no_ar(self, state):
+        """Run MoE compute WITHOUT AllReduce (AllReduce done separately)."""
+        hidden_states = state.pop("hidden_states_mlp_input")
+        # Pass should_allreduce_fusion=True to skip AllReduce inside MoE
+        state.hidden_states_mlp_output = self.mlp(
+            hidden_states, state.forward_batch, should_allreduce_fusion=True
+        )
+
+    def op_mlp_with_ar(self, state):
+        """Run MoE compute WITH synchronous AllReduce. Used for decode TBO."""
+        hidden_states = state.pop("hidden_states_mlp_input")
+        state.hidden_states_mlp_output = self.mlp(
+            hidden_states, state.forward_batch, should_allreduce_fusion=False
+        )
+
+    def op_launch_mlp_ar(self, state):
+        """Launch async AllReduce for MoE output on NCCL stream."""
+        hidden_states = state.pop("hidden_states_mlp_output")
+        if self.attn_tp_size > 1 and hidden_states.shape[0] > 0:
+            _AsyncAllReduce.launch(hidden_states)
+        state.hidden_states_mlp_ar_pending = hidden_states
+
+    def op_wait_mlp_ar_and_post(self, state):
+        """Wait for MoE AllReduce + residual connection for next layer."""
+        if self.attn_tp_size > 1 and state.hidden_states_mlp_ar_pending.shape[0] > 0:
+            _AsyncAllReduce.wait()
+        hidden_states = state.pop("hidden_states_mlp_ar_pending")
+        residual = state.pop("residual_after_norm")
+        # postprocess_layer for GPT-OSS with TP_ATTN_FULL is trivial (no-op),
+        # just pass hidden_states and residual to next layer's prepare_attn
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(
+            expect_keys={"positions", "forward_batch", "tbo_subbatch_index"}
+        )
+        return output
+
 
 class GptOssModel(nn.Module):
     def __init__(
@@ -605,15 +773,36 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
-                )
+        # Only use TBO for prefill (EXTEND) — decode has delta_stages=0, no overlap benefit
+        if forward_batch.can_run_tbo and forward_batch.forward_mode.is_extend():
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                model_forward_maybe_tbo,
+            )
+            from sglang.srt.layers.communicator import ScatterMode
+
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers[self.start_layer : self.end_layer],
+                enable_tbo=True,
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+                input_data_scatter_mode=(
+                    self.layers[self.start_layer].layer_scatter_modes.layer_input_mode
+                    if self.start_layer > 0
+                    else ScatterMode.TP_ATTN_FULL
+                ),
+            )
+        else:
+            aux_hidden_states = []
+            for i in range(self.start_layer, self.end_layer):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    if i in self.layers_to_capture:
+                        aux_hidden_states.append(hidden_states + residual)
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual
+                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -627,10 +816,9 @@ class GptOssModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if not forward_batch.can_run_tbo and len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class GptOssForCausalLM(nn.Module):

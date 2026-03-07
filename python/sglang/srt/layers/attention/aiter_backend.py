@@ -244,6 +244,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.logits_soft_cap = 0.0
 
+
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
@@ -1165,7 +1166,9 @@ class AiterAttnBackend(AttentionBackend):
 
                 # Full-attention indices: cumsum of seq_lens
                 seq_lens_local = forward_batch.seq_lens[:bs].to(self.device)
-                extend_full_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+                extend_full_kv_indptr = torch.zeros(
+                    bs0, dtype=torch.int32, device=self.device
+                )
                 extend_full_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_local, dim=0)
                 extend_full_total_kv_len = int(extend_full_kv_indptr[bs].item())
 
@@ -1192,7 +1195,9 @@ class AiterAttnBackend(AttentionBackend):
                     swa_size = self.sliding_window_size
                     swa_size_t = torch.tensor(swa_size, device=self.device)
                     window_kv_lens = torch.minimum(seq_lens_local, swa_size_t)
-                    extend_swa_kv_indptr = torch.zeros(bs0, dtype=torch.int32, device=self.device)
+                    extend_swa_kv_indptr = torch.zeros(
+                        bs0, dtype=torch.int32, device=self.device
+                    )
                     extend_swa_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
                     extend_swa_total_kv_len = int(extend_swa_kv_indptr[bs].item())
 
@@ -2533,9 +2538,10 @@ class AiterAttnBackend(AttentionBackend):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
+        num_tokens = q.shape[0]
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
                 dtype=self.input_dtype,
             )
         else:

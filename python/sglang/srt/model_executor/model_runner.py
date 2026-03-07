@@ -1967,7 +1967,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.decode_attn_backend_group.append(self._get_attention_backend())
             self.decode_attn_backend = self.decode_attn_backend_group[0]
         elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
-            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+            # GPT-OSS uses TBO only for prefill (delta_stages=0 for decode),
+            # so children attention backends don't need CUDA graph state.
+            # This saves 2x attention workspace memory.
+            arch = getattr(self.model_config.hf_config, "architectures", [""])[0]
+            needs_decode_tbo = arch not in ("GptOssForCausalLM",)
+            self.attn_backend = TboAttnBackend.init_new(
+                self._get_attention_backend,
+                cuda_graph_for_children=needs_decode_tbo,
+            )
         else:
             self.attn_backend = self._get_attention_backend()
 
@@ -2825,6 +2833,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # For decode with TBO, set tbo_split_seq_index early so CUDA graph
+        # can_run_tbo check passes. Don't split the batch — model skips TBO
+        # for decode. EXTEND TBO setup is done later (after the graph check).
+        if (
+            self.server_args.enable_two_batch_overlap
+            and not self.is_draft_worker
+            and forward_batch.tbo_split_seq_index is None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            from sglang.srt.model_executor.forward_batch_info import DpPaddingMode
+
+            forward_batch.tbo_split_seq_index = max(1, forward_batch.batch_size // 2)
+            if forward_batch.global_forward_mode is None:
+                forward_batch.global_forward_mode = forward_batch.forward_mode
+            if forward_batch.dp_padding_mode is None:
+                forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
+
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -2858,6 +2883,65 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+
+        # For non-DP attention with TBO enabled, compute tbo_split_seq_index
+        # (DP attention sets this in scheduler_dp_attn_mixin via prepare_mlp_sync_batch;
+        #  non-DP/non-PP needs it here)
+        if (
+            self.server_args.enable_two_batch_overlap
+            and not self.is_draft_worker
+            and forward_batch.tbo_split_seq_index is None
+        ):
+            from sglang.srt.batch_overlap.two_batch_overlap import (
+                TboForwardBatchPreparer,
+                compute_split_seq_index,
+                get_token_num_per_seq,
+            )
+            from sglang.srt.model_executor.forward_batch_info import DpPaddingMode
+
+            token_num_per_seq = get_token_num_per_seq(
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
+            if forward_batch.forward_mode.is_extend():
+                num_tokens_for_split = forward_batch.extend_num_tokens
+                extend_lens = forward_batch.extend_seq_lens_cpu
+            elif forward_batch.forward_mode.is_idle():
+                num_tokens_for_split = 0
+                extend_lens = None
+            else:
+                num_tokens_for_split = forward_batch.input_ids.shape[0]
+                extend_lens = None
+            split_idx = compute_split_seq_index(
+                forward_mode=forward_batch.forward_mode,
+                num_tokens=num_tokens_for_split,
+                extend_lens=extend_lens,
+                token_num_per_seq=token_num_per_seq,
+            )
+            if forward_batch.forward_mode.is_extend():
+                # For EXTEND (prefill): full TBO setup with batch splitting
+                forward_batch.tbo_split_seq_index = split_idx
+                if forward_batch.global_forward_mode is None:
+                    forward_batch.global_forward_mode = forward_batch.forward_mode
+                if forward_batch.dp_padding_mode is None:
+                    forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
+                TboForwardBatchPreparer.prepare(
+                    batch=forward_batch, is_draft_worker=self.is_draft_worker
+                )
+                if forward_batch.tbo_children:
+                    for child in forward_batch.tbo_children:
+                        child._pad_inputs_to_size(
+                            self, child.tbo_padded_len, child.batch_size
+                        )
+            else:
+                # For DECODE: set tbo_split_seq_index so CUDA graph can_run_tbo=True,
+                # but DON'T split the batch (model skips TBO for decode).
+                # Use max(1, split_idx) to avoid 0 which means "disabled".
+                forward_batch.tbo_split_seq_index = max(1, split_idx) if split_idx is not None else 1
+                if forward_batch.global_forward_mode is None:
+                    forward_batch.global_forward_mode = forward_batch.forward_mode
+                if forward_batch.dp_padding_mode is None:
+                    forward_batch.dp_padding_mode = DpPaddingMode.SUM_LEN
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
