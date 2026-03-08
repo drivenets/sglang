@@ -84,6 +84,13 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 
+@register_attention_backend("pod")
+def create_pod_backend(runner):
+    from sglang.srt.layers.attention.pod_backend import PodAttnBackend
+
+    return PodAttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (

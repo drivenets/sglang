@@ -59,12 +59,7 @@ except ImportError:
 
 from sglang.srt.compilation.piecewise_context_manager import is_piecewise_capture_active
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.utils import (
-    launch_reshape_and_cache_flash,
-    pad_sequence_with_mask,
-)
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, fp8_max
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -181,6 +176,15 @@ class AiterAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
 
+        # CUDA graph extend mode flags (initialized in init_cuda_graph_state if graphs enabled)
+        self._extend_no_prefix_graph_mode = False
+        self._extend_nopfx_graph_max_seqlen = 0
+        self._extend_nopfx_graph_bs = 0
+        self._extend_graph_mode = False
+
+        # Sliding window support
+        self.sliding_window_size = model_runner.sliding_window_size
+
         max_bs = model_runner.req_to_token_pool.size
 
         if kv_indptr_buf is None:
@@ -273,17 +277,13 @@ class AiterAttnBackend(AttentionBackend):
         )
         # Track which layers have been calibrated (first-extend scale computation)
         self._fp8_scales_calibrated = [False] * num_layers
-        # Host-side scalar mirrors of the per-layer scales. Populated during extend
-        # (outside CUDA graph capture) so forward_decode can read them without a
-        # device->host .item() call that would fail inside graph capture.
-        self._fp8_k_scale_val_per_layer = [1.0] * num_layers
-        self._fp8_v_scale_val_per_layer = [1.0] * num_layers
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         # Persistent ones buffer for Q descale (Q is cast to FP8 without scaling)
         self._ones_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
-        self._fp8_safe_max = 400.0  # Safe max for FP8 E4M3 (actual max is 448)
+        # Platform-aware safe max: fp8_max is 224 for fnuz (ROCm), 448 for fn (CUDA)
+        self._fp8_safe_max = fp8_max * 0.9  # 90% of max to avoid edge saturation
         self._fp8_safe_max_t = torch.tensor(
             [self._fp8_safe_max], dtype=torch.float32, device=self.device
         )
@@ -1320,6 +1320,52 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        # Sliding window cuda graph buffers
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            if kv_indices_buf is None:
+                self.cuda_graph_window_kv_indices = torch.zeros(
+                    (max_num_tokens * self.sliding_window_size),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
+
+        # --- Extend/MIXED graph buffers ---
+        # Pre-allocate buffers for CUDA-graph-captured EXTEND/MIXED forward passes.
+        # These avoid dynamic allocations and .item() calls inside forward_extend.
+        self._extend_graph_mode = False
+        self._extend_graph_max_extend_len = 0
+        self._extend_graph_max_seqlen_k = 0
+        self._extend_graph_bs = 0
+
+        # --- Extend no-prefix graph mode ---
+        # For whole-model CUDA graph capture of EXTEND batches (extend_no_prefix path).
+        # When True, forward_extend uses flash_attn_varlen_func with pre-set max_len
+        # instead of computing max() on CPU.
+        self._extend_no_prefix_graph_mode = False
+        self._extend_nopfx_graph_max_seqlen = 0
+        self._extend_nopfx_graph_bs = 0
+        # all_kv_indices for the prefix-path mha_batch_prefill_func.
+        # Size: max_bs * max_context_len + 256 (padding for AITER overread)
+        self.cuda_graph_extend_kv_indices = torch.zeros(
+            max_bs * self.max_context_len + 256,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        # kv_indptr for extend (different from decode kv_indptr)
+        self.cuda_graph_extend_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        # qo_indptr for extend
+        self.cuda_graph_extend_qo_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
+        # seqlen_k per request for mha_batch_prefill_func
+        self.cuda_graph_extend_seqlen_k = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
         if self.use_mla and _use_mla_ps_kernel:
             # for persistent mla_decode_fwd
@@ -2263,16 +2309,17 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
-                # both unified attention and sliding window kv pool are active.
-                if (
-                    self.use_triton_unified_attention
-                    and self.use_sliding_window_kv_pool
-                ):
-
-                    token_to_kv_pool = forward_batch.token_to_kv_pool
-                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
+                # Check if fused RoPE + KV cache write is available
+                _has_fused_rope = (
+                    _has_fused_rope_cache
+                    and hasattr(layer, '_fused_rope_cos')
+                    and not self.use_mla
+                )
+                if _has_fused_rope:
+                    # Fused path: apply RoPE and write to cache in one kernel
+                    self._apply_fused_rope_and_cache(
+                        q, k, v, layer, forward_batch, cache_loc,
+                        is_extend=True,
                     )
                     slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
@@ -2301,8 +2348,9 @@ class AiterAttnBackend(AttentionBackend):
                     if self.kv_cache_dtype == fp8_dtype:
                         k_absmax = k.abs().amax()
                         v_absmax = v.abs().amax()
-                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-6)
-                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-6)
+                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
+                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
+                        # Update running max (extend is not graph-captured)
                         lid = layer.layer_id
                         self._fp8_k_scale_per_layer[lid] = torch.maximum(
                             self._fp8_k_scale_per_layer[lid], k_scale
@@ -2618,9 +2666,124 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # To keep the mha_batch_prefill_func function parameters
-            # declare the necessary parameter and assign None as default value
-            q_descale = None
+            # ---- Whole-model CUDA graph: extend_no_prefix path ----
+            # When _extend_no_prefix_graph_mode is True, use flash_attn_varlen_func
+            # with pre-set max_len (avoids CPU max() call). The cu_seqlens are
+            # computed by torch.cumsum inside the graph (graph-safe GPU op).
+            # forward_batch.extend_seq_lens is a static buffer updated before replay.
+            if self._extend_no_prefix_graph_mode:
+                bs = self._extend_nopfx_graph_bs
+                bs0 = bs + 1
+                max_len = self._extend_nopfx_graph_max_seqlen
+
+                # Sliding window not supported in this graph mode
+                sliding_window_size = -1
+                window_size = (-1, -1, 0)
+
+                # Extract attention sinks
+                sinks = kwargs.get("sinks", None)
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
+                # Compute cu_seqlens from static extend_seq_lens buffer (graph-safe)
+                cu_seqlens = self.cuda_graph_extend_qo_indptr
+                cu_seqlens[1 : bs + 1] = torch.cumsum(
+                    forward_batch.extend_seq_lens[:bs], dim=0
+                )
+                cu_seqlens_slice = cu_seqlens[:bs0]
+
+                q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+                o_attn = flash_attn_varlen_func(
+                    q_view,
+                    k,
+                    v,
+                    cu_seqlens_slice,
+                    cu_seqlens_slice,  # same as Q — pure self-attention
+                    max_len,
+                    max_len,
+                    min_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    sink_ptr=sink_ptr,
+                )
+                return o_attn.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # ---- CUDA graph-safe extend path (KV cache read) ----
+            # When _extend_graph_mode is True, all metadata is pre-computed in
+            # init_forward_metadata_{capture,replay}_cuda_graph. We skip dynamic
+            # allocations, .item() calls, and CPU-side checks.
+            # NOTE: This path does NOT support SWA layers correctly — the
+            # kv_indices are full pool indices not translated to SWA space.
+            # Currently only activated for non-SWA prefix extends (rare).
+            if self._extend_graph_mode:
+                bs = self._extend_graph_bs
+                bs0 = bs + 1
+
+                # Sliding window not supported in graph mode (rare for gpt-oss)
+                sliding_window_size = -1
+                window_size = (-1, -1)
+
+                # Extract attention sinks
+                sinks = kwargs.get("sinks", None)
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
+                # Use pre-allocated graph buffers (filled during replay_prepare)
+                cu_seqlens_q = self.cuda_graph_extend_qo_indptr[:bs0]
+                all_kv_indptr = self.cuda_graph_extend_kv_indptr[:bs0]
+                all_kv_indices = self.cuda_graph_extend_kv_indices
+                seqlen_k = self.cuda_graph_extend_seqlen_k[:bs]
+                max_extend_len = self._extend_graph_max_extend_len
+                max_seqlen_k = self._extend_graph_max_seqlen_k
+
+                q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+                if self.kv_cache_dtype == fp8_dtype:
+                    lid = layer.layer_id
+                    total_kv = all_kv_indptr[bs]
+                    idx = all_kv_indices[:total_kv].long()
+                    k_gathered = k_cache[idx].to(torch.bfloat16) * self._fp8_k_scale_per_layer[lid]
+                    v_gathered = v_cache[idx].to(torch.bfloat16) * self._fp8_v_scale_per_layer[lid]
+                    contiguous_indices = torch.arange(
+                        all_kv_indices.shape[0], dtype=torch.int32, device=self.device
+                    )
+                    o_aiter = mha_batch_prefill_func(
+                        q_view, k_gathered, v_gathered,
+                        cu_seqlens_q, all_kv_indptr, contiguous_indices,
+                        max_extend_len, max_seqlen_k,
+                        softmax_scale=layer.scaling,
+                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                        causal=True, window_size=window_size,
+                        seqlen_k=seqlen_k, sink_ptr=sink_ptr,
+                    )
+                else:
+                    o_aiter = mha_batch_prefill_func(
+                        q_view, k_cache, v_cache,
+                        cu_seqlens_q, all_kv_indptr, all_kv_indices,
+                        max_extend_len, max_seqlen_k,
+                        softmax_scale=layer.scaling,
+                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
+                        causal=True, window_size=window_size,
+                        seqlen_k=seqlen_k, sink_ptr=sink_ptr,
+                    )
+                return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # ---- Original (non-graph) extend path ----
+            # Determine sliding window settings
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                sliding_window_size = layer.sliding_window_size
+                kv_indptr = self.forward_metadata.window_kv_indptr
+                kv_indices = self.forward_metadata.window_kv_indices
+                window_kv_offsets = self.forward_metadata.window_kv_start_idx
+            else:
+                sliding_window_size = -1
+                kv_indptr = self.forward_metadata.kv_indptr
+                kv_indices = self.forward_metadata.kv_indices
+                window_kv_offsets = None
 
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
@@ -2812,28 +2975,50 @@ class AiterAttnBackend(AttentionBackend):
                 if sinks is not None:
                     sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
 
-                paged_attention_ragged(
-                    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    self.workspace_buffer,
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                    self.scale,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.kv_last_page_len,
-                    1,
-                    self.max_num_partitions,
-                    None,
-                    "auto",
-                    "NHD",
-                    self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
-                    None,
-                    _AITER_PARTITION_SIZE_ROCM,
-                    sink_ptr=sink_ptr,
-                )
+            # FP8 decode scales: use the frozen per-layer scales that were
+            # calibrated on the first extend.  These are views into a persistent
+            # tensor, so the data_ptr is stable for CUDA graph replay.
+            if self.kv_cache_dtype == fp8_dtype:
+                lid = layer.layer_id
+                decode_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
+                decode_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
+            else:
+                decode_k_scale = self.k_scale
+                decode_v_scale = self.v_scale
+
+            # Get sinks from kwargs (passed from model for attention sink support)
+            sinks = kwargs.get("sinks", None)
+            
+            # Convert sinks to float32 if provided (kernel expects float32)
+            sink_ptr = None
+            if sinks is not None:
+                if sinks.dtype != torch.float32:
+                    sink_ptr = sinks.to(torch.float32)
+                else:
+                    sink_ptr = sinks
+
+            paged_attention_ragged(
+                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                self.workspace_buffer,
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k_cache_view.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                v_cache_view.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                self.scale,
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len,
+                1,
+                self.max_num_partitions,
+                None,
+                kv_cache_dtype_str,
+                "NHD",
+                self.logits_soft_cap,
+                decode_k_scale,  # Use per-layer dynamic scale
+                decode_v_scale,  # Use per-layer dynamic scale
+                None,
+                _AITER_PARTITION_SIZE_ROCM,
+                sink_ptr=sink_ptr,  # Pass attention sinks to kernel
+            )
 
         return o
 
