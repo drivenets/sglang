@@ -141,6 +141,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dual_chunk_flash_attn",
     # AMD specific
     "aiter",
+    "pod",
     "wave",
     # Other platforms
     "intel_amx",
@@ -2465,6 +2466,14 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+        if self.attention_backend == "pod":
+            if not self.enable_mixed_chunk:
+                logger.warning(
+                    "POD attention requires mixed chunked prefill. "
+                    "Auto-enabling --enable-mixed-chunk."
+                )
+                self.enable_mixed_chunk = True
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
