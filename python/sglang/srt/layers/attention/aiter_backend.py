@@ -2724,10 +2724,6 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
-
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
-            )
             if _has_fused_rope:
                 # Fused path: apply RoPE and write to cache in one kernel
                 self._apply_fused_rope_and_cache(
