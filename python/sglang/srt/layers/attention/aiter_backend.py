@@ -13,6 +13,12 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+# Sparse prefill disabled — Python-level block loops are 20x slower than
+# fused flash attention. Needs a fused Triton/CK kernel to be viable.
+# from sglang.srt.layers.attention.sparse_prefill import (
+#     should_use_sparse,
+#     sparse_flash_attn_varlen,
+# )
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
@@ -1179,9 +1185,10 @@ class AiterAttnBackend(AttentionBackend):
 
                 # Full-attention indices: cumsum of seq_lens
                 seq_lens_local = forward_batch.seq_lens[:bs].to(self.device)
-                extend_full_kv_indptr = torch.zeros(
+                extend_full_kv_indptr = torch.empty(
                     bs0, dtype=torch.int32, device=self.device
                 )
+                extend_full_kv_indptr[0] = 0
                 extend_full_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_local, dim=0)
                 extend_full_total_kv_len = int(extend_full_kv_indptr[bs].item())
 
@@ -1208,9 +1215,10 @@ class AiterAttnBackend(AttentionBackend):
                     swa_size = self.sliding_window_size
                     swa_size_t = torch.tensor(swa_size, device=self.device)
                     window_kv_lens = torch.minimum(seq_lens_local, swa_size_t)
-                    extend_swa_kv_indptr = torch.zeros(
+                    extend_swa_kv_indptr = torch.empty(
                         bs0, dtype=torch.int32, device=self.device
                     )
+                    extend_swa_kv_indptr[0] = 0
                     extend_swa_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
                     extend_swa_total_kv_len = int(extend_swa_kv_indptr[bs].item())
 

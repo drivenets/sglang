@@ -1,8 +1,9 @@
 """
 POD (Prefill-On-Decode) attention backend for SGLang.
 
-Fuses prefill and decode attention into a single kernel launch,
-running them concurrently on different CUs for improved hardware utilization.
+Runs prefill and decode attention as separate standard kernels on different
+CUDA streams, achieving compute overlap without shared locks or persistent
+kernels.
 
 Inherits from AiterAttnBackend and overrides forward_extend() to intercept
 MIXED batches (prefill + decode in same forward pass). Falls back to parent
@@ -14,11 +15,9 @@ Requires: --attention-backend pod --enable-mixed-chunk --disable-cuda-graph
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING
 
 import torch
-import triton
 
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -29,10 +28,6 @@ if TYPE_CHECKING:
 
 try:
     from aiter import flash_attn_varlen_func
-    from aiter.ops.triton.attention.pod_attention import (
-        pod_attention,
-        get_num_splits_and_buffer_sizes,
-    )
 except ImportError:
     pass
 
@@ -48,69 +43,14 @@ logger = logging.getLogger(__name__)
 
 
 class PodAttnBackend(AiterAttnBackend):
-    """POD attention: fuses prefill + decode on different CUs."""
+    """POD attention: runs prefill + decode concurrently on separate streams."""
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
 
-        # POD block sizes (matching lean_atten defaults for gfx942)
-        self.pod_block_m = 128      # Decode query tile
-        self.pod_block_n = 64       # Decode key tile
-        self.pod_block_m_pf = 128   # Prefill query tile
-        self.pod_block_n_pf = 64    # Prefill key tile
-        self.pod_num_warps = 4
-        self.pod_waves_per_eu = 2
-        self.pod_max_output_tile_cnt = 16
-
-        # Get CU count for this device
-        props = torch.cuda.get_device_properties(self.device)
-        self.pod_num_cus = props.multi_processor_count
-        self.pod_total_programs = self.pod_num_cus * 2  # 2 WGs per CU
-
-        # Scratch buffers allocated lazily on first POD call
-        self._pod_buffers_initialized = False
-
-    def _init_pod_buffers(self):
-        """Lazily allocate POD scratch buffers."""
-        if self._pod_buffers_initialized:
-            return
-
-        T = self.pod_total_programs
-        BM = self.pod_block_m
-        BM_pf = self.pod_block_m_pf
-        HD = self.head_dim
-        MOT = self.pod_max_output_tile_cnt
-
-        logger.info(
-            "POD: allocating scratch buffers (total_programs=%d, "
-            "BLOCK_M=%d/%d, HEAD_DIM=%d, max_output_tiles=%d)",
-            T, BM, BM_pf, HD, MOT,
-        )
-
-        # CU counter (shared between decode and prefill)
-        self.pod_cu_ctr = torch.zeros(512, dtype=torch.int32, device=self.device)
-
-        # Decode scratch
-        self.pod_Mp = torch.zeros((T, BM), dtype=torch.float32, device=self.device)
-        self.pod_Lp = torch.zeros((T, BM), dtype=torch.float32, device=self.device)
-        self.pod_Op = torch.zeros(
-            (T, MOT * BM, HD), dtype=torch.bfloat16, device=self.device
-        )
-        self.pod_locks = torch.zeros(T, dtype=torch.int32, device=self.device)
-
-        # Prefill scratch
-        self.pod_Mp_pf = torch.zeros(
-            (T, BM_pf), dtype=torch.float32, device=self.device
-        )
-        self.pod_Lp_pf = torch.zeros(
-            (T, BM_pf), dtype=torch.float32, device=self.device
-        )
-        self.pod_Op_pf = torch.zeros(
-            (T, MOT * BM_pf, HD), dtype=torch.bfloat16, device=self.device
-        )
-        self.pod_locks_pf = torch.zeros(T, dtype=torch.int32, device=self.device)
-
-        self._pod_buffers_initialized = True
+        # Separate CUDA stream for prefill overlap (decode runs on default stream)
+        self._prefill_stream = torch.cuda.Stream()
+        self._prefill_event = torch.cuda.Event()
 
     def forward_extend(
         self,
@@ -208,9 +148,7 @@ class PodAttnBackend(AiterAttnBackend):
                     k_scale=k_scale_val, v_scale=v_scale_val,
                 )
 
-        # ---- POD attention ----
-        self._init_pod_buffers()
-
+        # ---- Split batch into prefill and decode ----
         bs = forward_batch.batch_size
         n_no_prefix = sum(
             1 for p in forward_batch.extend_prefix_lens_cpu if p == 0
@@ -256,87 +194,65 @@ class PodAttnBackend(AiterAttnBackend):
             k_dec = k_cache[idx]  # (total_kv_tokens, H_K, D)
             v_dec = v_cache[idx]
 
-        # Build batch_num_block_n for decode (cumulative BLOCK_N counts)
-        BLOCK_N = self.pod_block_n
+        # Build cu_seqlens for decode (each request has 1 query token)
         decode_kv_lens = forward_batch.seq_lens_cpu[n_no_prefix:bs]
-        block_counts = torch.tensor(
-            [(l + BLOCK_N - 1) // BLOCK_N for l in decode_kv_lens],
-            dtype=torch.int32,
-            device=self.device,
+        cu_seqlens_q_dec = torch.arange(
+            n_decode + 1, dtype=torch.int32, device=self.device
         )
-        batch_num_block_n = torch.cumsum(block_counts, dim=0)
+        cu_seqlens_kv_dec = torch.zeros(
+            n_decode + 1, dtype=torch.int32, device=self.device
+        )
+        kv_lens_tensor = torch.tensor(
+            list(decode_kv_lens), dtype=torch.int32, device=self.device
+        )
+        torch.cumsum(kv_lens_tensor, dim=0, out=cu_seqlens_kv_dec[1:])
 
-        # Build batch_num_block_n_pf for prefill
-        BLOCK_N_pf = self.pod_block_n_pf
+        # Build cu_seqlens for prefill
         prefill_seq_lens = forward_batch.extend_seq_lens_cpu[:n_no_prefix]
-        block_counts_pf = torch.tensor(
-            [(l + BLOCK_N_pf - 1) // BLOCK_N_pf for l in prefill_seq_lens],
-            dtype=torch.int32,
-            device=self.device,
+        pf_lens_tensor = torch.tensor(
+            list(prefill_seq_lens), dtype=torch.int32, device=self.device
         )
-        batch_num_block_n_pf = torch.cumsum(block_counts_pf, dim=0)
-
-        # Reset scratch buffers
-        self.pod_cu_ctr.zero_()
-        self.pod_locks.zero_()
-        self.pod_locks_pf.zero_()
+        cu_seqlens_pf = torch.zeros(
+            n_no_prefix + 1, dtype=torch.int32, device=self.device
+        )
+        torch.cumsum(pf_lens_tensor, dim=0, out=cu_seqlens_pf[1:])
 
         # Debug logging (first call per layer only)
         if layer.layer_id == 0:
             logger.debug(
-                "POD _forward_pod: bs=%d n_no_prefix=%d n_decode=%d "
-                "T_prefill=%d q_dec=%s k_dec=%s q_pf=%s k_pf=%s "
-                "batch_num_block_n=%s batch_num_block_n_pf=%s "
-                "decode_kv_lens=%s prefill_seq_lens=%s "
-                "kv_offset=%d total_kv_len_rest=%d "
-                "k_cache_shape=%s v_cache_shape=%s "
-                "idx_min=%d idx_max=%d idx_len=%d",
+                "POD split-stream: bs=%d n_pf=%d n_dec=%d T_pf=%d "
+                "q_dec=%s k_dec=%s q_pf=%s k_pf=%s",
                 bs, n_no_prefix, n_decode,
                 T_prefill, list(q_dec.shape), list(k_dec.shape),
                 list(q_pf.shape), list(k_pf.shape),
-                batch_num_block_n.tolist(), batch_num_block_n_pf.tolist(),
-                list(decode_kv_lens), list(prefill_seq_lens),
-                kv_offset, total_kv_len_rest,
-                list(k_cache.shape), list(v_cache.shape),
-                idx.min().item(), idx.max().item(), len(idx),
             )
 
-        # Call POD attention
-        o_dec, o_pf = pod_attention(
-            cu_ctr=self.pod_cu_ctr,
-            # Decode
-            q=q_dec,
-            k=k_dec,
-            v=v_dec,
-            Mp=self.pod_Mp,
-            Lp=self.pod_Lp,
-            Op=self.pod_Op,
-            locks=self.pod_locks,
-            batch_num_block_n=batch_num_block_n,
-            total_programs=self.pod_total_programs,
-            BLOCK_M=self.pod_block_m,
-            BLOCK_N=self.pod_block_n,
-            batch_size=n_decode,
-            sm_scale=layer.scaling,
-            num_warps=self.pod_num_warps,
-            waves_per_eu=self.pod_waves_per_eu,
-            # Prefill
-            q_pf=q_pf,
-            k_pf=k_pf,
-            v_pf=v_pf,
-            Mp_pf=self.pod_Mp_pf,
-            Lp_pf=self.pod_Lp_pf,
-            Op_pf=self.pod_Op_pf,
-            locks_pf=self.pod_locks_pf,
-            batch_num_block_n_pf=batch_num_block_n_pf,
-            BLOCK_M_pf=self.pod_block_m_pf,
-            BLOCK_N_pf=self.pod_block_n_pf,
-            batch_size_pf=n_no_prefix,
-            prefill_ratio=1,
-            decode_ratio=1,
+        # ---- Launch prefill on separate stream (overlaps with decode) ----
+        default_stream = torch.cuda.current_stream()
+        self._prefill_stream.wait_stream(default_stream)
+
+        with torch.cuda.stream(self._prefill_stream):
+            o_pf = flash_attn_varlen_func(
+                q_pf, k_pf, v_pf,
+                cu_seqlens_pf, cu_seqlens_pf,
+                max(prefill_seq_lens), max(prefill_seq_lens),
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+            self._prefill_event.record()
+
+        # ---- Launch decode on default stream (overlaps with prefill) ----
+        o_dec = flash_attn_varlen_func(
+            q_dec, k_dec, v_dec,
+            cu_seqlens_q_dec, cu_seqlens_kv_dec,
+            1, max(decode_kv_lens),
+            softmax_scale=layer.scaling,
+            causal=False,  # decode: 1 query vs full KV, no causal mask needed
         )
 
-        # Concatenate: [prefill_output, decode_output] to match input order
+        # ---- Sync and combine ----
+        default_stream.wait_event(self._prefill_event)
+
         out_dim = layer.tp_q_head_num * layer.v_head_dim
         o_combined = torch.cat(
             [
