@@ -2083,6 +2083,81 @@ class AiterAttnBackend(AttentionBackend):
         # base class NotImplementedError.
         pass
 
+    def _apply_fused_rope_and_cache(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        cache_loc: torch.Tensor,
+        is_extend: bool = False,
+    ):
+        """Apply fused RoPE + KV cache write using aiter kernel."""
+        num_tokens = k.shape[0]
+
+        if is_piecewise_capture_active():
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v,
+            )
+            return
+
+        q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        cos_cache = layer._fused_rope_cos
+        sin_cache = layer._fused_rope_sin
+        is_neox = layer._fused_rope_is_neox
+        positions = layer._fused_rope_positions[:num_tokens]
+
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+        ):
+            mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+            cache_loc = mapping[cache_loc].long()
+
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+        if self.kv_cache_dtype == fp8_dtype:
+            k_cache = k_cache.view(self.kv_cache_dtype)
+            v_cache = v_cache.view(self.kv_cache_dtype)
+
+        k_cache_4d = k_cache.unsqueeze(1)
+        v_cache_4d = v_cache.unsqueeze(1)
+
+        if self.kv_cache_dtype == fp8_dtype:
+            lid = layer.layer_id
+            if is_extend and not self._fp8_scales_calibrated[lid]:
+                k_absmax = k.abs().amax()
+                v_absmax = v.abs().amax()
+                _CALIB_THRESHOLD = 0.1
+                if k_absmax.item() > _CALIB_THRESHOLD and v_absmax.item() > _CALIB_THRESHOLD:
+                    k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-6)
+                    v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-6)
+                    self._fp8_k_scale_per_layer[lid] = k_scale_new
+                    self._fp8_v_scale_per_layer[lid] = v_scale_new
+                    self._fp8_scales_calibrated[lid] = True
+            fused_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
+            fused_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
+        else:
+            fused_k_scale = self.k_scale
+            fused_v_scale = self.v_scale
+
+        fused_qk_rope_reshape_and_cache(
+            q_3d, k, v,
+            k_cache_4d, v_cache_4d,
+            cache_loc, positions,
+            cos_cache, sin_cache,
+            fused_k_scale, fused_v_scale,
+            is_neox,
+            flash_layout=True,
+            apply_scale=(self.kv_cache_dtype == fp8_dtype),
+            q_out=q_3d, k_out=k,
+            output_zeros=False,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
