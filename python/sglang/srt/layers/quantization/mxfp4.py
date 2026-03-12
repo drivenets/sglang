@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING, List, Optional
 
@@ -45,6 +46,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
+    log_info_on_rank0,
     mxfp_supported,
     next_power_of_2,
     round_up,
@@ -54,6 +56,7 @@ from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
+logger = logging.getLogger(__name__)
 
 
 if is_flashinfer_available():
