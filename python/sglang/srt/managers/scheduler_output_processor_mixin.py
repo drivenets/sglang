@@ -462,14 +462,6 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
-                    if req.finished_reason is not None:
-                        self.maybe_collect_routed_experts(req)
-                        if has_kv_offload:
-                            if not self.decode_offload_manager.offload_kv_cache(req):
-                                release_kv_cache(req, tree_cache)
-                        else:
-                            release_kv_cache(req, tree_cache)
-                        req.time_stats.completion_time = time.perf_counter()
         else:
             # General path: handles all features
             for i in range(num_reqs):
@@ -542,9 +534,6 @@ class SchedulerOutputProcessorMixin:
                         req.output_token_ids_logprobs_idx.append(
                             logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                         )
-
-                if enable_overlap and (req.finished_reason is not None or req.is_retracted):
-                    continue
 
                 new_accepted_len = 1
                 if is_no_spec:
