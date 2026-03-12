@@ -193,6 +193,16 @@ class AiterAttnBackend(AttentionBackend):
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
 
+        # Sliding window buffers - needed for models with sliding window attention
+        self.window_kv_indptr = None
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            if kv_indptr_buf is None:
+                self.window_kv_indptr = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                )
+            else:
+                self.window_kv_indptr = torch.zeros_like(kv_indptr_buf)
+
         # Create prefill indices updater
         if not skip_prefill:
             self.indices_updater_prefill = AiterIndicesUpdaterPrefill(
@@ -248,6 +258,8 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
+
+            self.enable_dp_attention = is_dp_attention_enabled()
 
             # current mla_decode_fwd onln support fake-nps in self.num_head == 16
             # so all num_head size does not use qh16 kernel to simulate
