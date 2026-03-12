@@ -115,6 +115,17 @@ class ForwardMetadata:
     mask_indptr: Optional[torch.Tensor] = None
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
+    # Sliding window support
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
+    window_kv_start_idx: Optional[torch.Tensor] = None
+    # Pre-computed KV indices for forward_extend (cached across layers)
+    extend_full_kv_indptr: Optional[torch.Tensor] = None
+    extend_full_kv_indices: Optional[torch.Tensor] = None
+    extend_full_total_kv_len: int = 0
+    extend_swa_kv_indptr: Optional[torch.Tensor] = None
+    extend_swa_kv_indices: Optional[torch.Tensor] = None
+    extend_swa_total_kv_len: int = 0
 
 
 global_workspace_buffer = None
@@ -2756,7 +2767,7 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            o = mha_batch_prefill_func(
+            o_aiter = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
