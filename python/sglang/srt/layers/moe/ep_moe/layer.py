@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
@@ -723,7 +724,51 @@ class MoriEPMoE(DeepEPMoE):
                 # fused_moe with QuantType.per_1x32 can accept pre-quantized fp4x2 input
                 quant_type = QuantType.per_1x32
 
-        if is_quark_w4a4:
+        hidden_pad = 0
+        intermediate_pad = 0
+
+        if is_mxfp4:
+            # Dual MXFP4: select 32x32 weights for large M (prefill), 16x16 for small M (decode)
+            use_warp32 = False
+            if getattr(self, "has_dual_moe", False):
+                M = dispatch_a1.shape[0]
+                dual_threshold = int(os.environ.get("AITER_MOE_DUAL_THRESHOLD", "2048"))
+                if M >= dual_threshold:
+                    use_warp32 = True
+                    w13_weight = self.w13_weight_32
+                    w2_weight = self.w2_weight_32
+                os.environ["AITER_MOE_WARP32"] = "1" if use_warp32 else "0"
+
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = w2_weight.view(torch.float4_e2m1fn_x2)
+
+            if use_warp32:
+                w13_scale = self.w13_weight_scale_32
+                w2_scale = self.w2_weight_scale_32
+            else:
+                w13_scale = self.w13_weight_scale
+                w2_scale = self.w2_weight_scale
+            quant_type = QuantType.per_1x32
+
+            if hasattr(w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+
+            # Pad activation to match padded weight K dimension (e.g. 2880→3072)
+            hidden_pad = getattr(self.quant_method, "hidden_pad", 0)
+            if use_warp32:
+                intermediate_pad = getattr(self, "intermediate_pad_32", 0)
+            else:
+                intermediate_pad = getattr(self.quant_method, "intermediate_pad", 0)
+            if hidden_pad > 0:
+                dispatch_a1 = torch.nn.functional.pad(
+                    dispatch_a1,
+                    (0, hidden_pad),
+                    mode="constant",
+                    value=0.0,
+                )
+        elif is_quark_w4a4:
             if hasattr(torch, "float4_e2m1fn_x2"):
                 w13_weight = self.w13_weight.view(torch.float4_e2m1fn_x2)
                 w2_weight = self.w2_weight.view(torch.float4_e2m1fn_x2)
