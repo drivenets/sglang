@@ -44,18 +44,40 @@ def execute_overlapped_operations(
     executor_a = _StageExecutor("a", stages_a, inputs=inputs_a)
     executor_b = _StageExecutor("b", stages_b, inputs=inputs_b)
 
+    # Multi-stream overlap: A runs on default stream, B runs on a separate stream.
+    # This allows A's compute to overlap with B's AllReduce and vice versa.
+    _ensure_overlap_stream()
+
+    # Initial stages for A only (on default stream)
     for _ in range(delta_stage):
         executor_a.next()
 
+    # Interleaved stages: A on default stream, B on _overlap_stream
     for _ in range(executor_a.num_stages - delta_stage):
         executor_a.next()
-        executor_b.next()
+        with torch.cuda.stream(_overlap_stream):
+            executor_b.next()
 
+    # Final stages for B (on _overlap_stream)
     for _ in range(delta_stage):
-        executor_b.next()
+        with torch.cuda.stream(_overlap_stream):
+            executor_b.next()
+
+    # Sync: default stream waits for B's stream to complete
+    torch.cuda.current_stream().wait_stream(_overlap_stream)
 
     assert executor_a.done and executor_b.done
     return [executor_a.output, executor_b.output]
+
+
+# Lazily-created CUDA stream for sub-batch B overlap
+_overlap_stream = None
+
+
+def _ensure_overlap_stream():
+    global _overlap_stream
+    if _overlap_stream is None:
+        _overlap_stream = torch.cuda.Stream()
 
 
 class YieldOperation:

@@ -110,37 +110,39 @@ class _AsyncAllReduce:
     """Launch NCCL AllReduce on a dedicated CUDA stream for compute-comm overlap.
 
     Used by TBO (Two-Batch Overlap) to hide AllReduce latency behind the other
-    sub-batch's compute on the default stream. The AllReduce runs on a separate
-    stream so GPU compute can proceed in parallel.
+    sub-batch's compute. Each sub-batch runs on its own CUDA stream (A on default,
+    B on a separate stream). AllReduce runs on a dedicated NCCL stream.
+
+    Per-subbatch events ensure A's wait() gets A's completion event (not B's).
     """
 
     _stream = None
-    _event = None
+    _events = None  # [event_for_subbatch_0, event_for_subbatch_1]
     _group = None
 
     @classmethod
     def _ensure_init(cls):
         if cls._stream is None:
             cls._stream = torch.cuda.Stream()
-            cls._event = torch.cuda.Event()
+            cls._events = [torch.cuda.Event(), torch.cuda.Event()]
             from sglang.srt.distributed import get_tp_group
 
             cls._group = get_tp_group().device_group
 
     @classmethod
-    def launch(cls, tensor):
-        """Launch in-place AllReduce on NCCL stream. Returns immediately on default stream."""
+    def launch(cls, tensor, subbatch_idx=0):
+        """Launch in-place AllReduce on NCCL stream. Returns immediately on caller's stream."""
         cls._ensure_init()
-        default_stream = torch.cuda.current_stream()
-        cls._stream.wait_stream(default_stream)
+        caller_stream = torch.cuda.current_stream()
+        cls._stream.wait_stream(caller_stream)
         with torch.cuda.stream(cls._stream):
             dist.all_reduce(tensor, group=cls._group)
-            cls._event.record()
+            cls._events[subbatch_idx].record()
 
     @classmethod
-    def wait(cls):
-        """Block default stream until the AllReduce on NCCL stream completes."""
-        torch.cuda.current_stream().wait_event(cls._event)
+    def wait(cls, subbatch_idx=0):
+        """Block caller's stream until this subbatch's AllReduce completes."""
+        torch.cuda.current_stream().wait_event(cls._events[subbatch_idx])
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -648,13 +650,13 @@ class GptOssDecoderLayer(nn.Module):
         """Launch async AllReduce for attention output on NCCL stream."""
         hidden_states = state.pop("hidden_states_after_attn")
         if self.attn_tp_size > 1 and hidden_states.shape[0] > 0:
-            _AsyncAllReduce.launch(hidden_states)
+            _AsyncAllReduce.launch(hidden_states, state.tbo_subbatch_index or 0)
         state.hidden_states_ar_pending = hidden_states
 
     def op_wait_attn_ar_and_norm(self, state):
         """Wait for attn AllReduce, then apply post_attention_layernorm + residual."""
         if self.attn_tp_size > 1 and state.hidden_states_ar_pending.shape[0] > 0:
-            _AsyncAllReduce.wait()
+            _AsyncAllReduce.wait(state.tbo_subbatch_index or 0)
         hidden_states = state.pop("hidden_states_ar_pending")
         residual = state.pop("residual")
         if hidden_states.shape[0] != 0:
@@ -683,13 +685,13 @@ class GptOssDecoderLayer(nn.Module):
         """Launch async AllReduce for MoE output on NCCL stream."""
         hidden_states = state.pop("hidden_states_mlp_output")
         if self.attn_tp_size > 1 and hidden_states.shape[0] > 0:
-            _AsyncAllReduce.launch(hidden_states)
+            _AsyncAllReduce.launch(hidden_states, state.tbo_subbatch_index or 0)
         state.hidden_states_mlp_ar_pending = hidden_states
 
     def op_wait_mlp_ar_and_post(self, state):
         """Wait for MoE AllReduce + residual connection for next layer."""
         if self.attn_tp_size > 1 and state.hidden_states_mlp_ar_pending.shape[0] > 0:
-            _AsyncAllReduce.wait()
+            _AsyncAllReduce.wait(state.tbo_subbatch_index or 0)
         hidden_states = state.pop("hidden_states_mlp_ar_pending")
         residual = state.pop("residual_after_norm")
         # postprocess_layer for GPT-OSS with TP_ATTN_FULL is trivial (no-op),
@@ -1044,6 +1046,18 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
+            # Filter by PP rank — skip layers not on this rank
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
             weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
