@@ -21,11 +21,9 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.distributed import (
-    attention_tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -52,7 +50,6 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -60,7 +57,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
@@ -71,6 +67,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
@@ -104,18 +101,7 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
-        and not is_flashinfer_allreduce_unavailable()
-        # FlashInfer's TRT-LLM allreduce backend creates its own NCCL communicator
-        # which doesn't support PyTorch sub-process groups used by context parallelism
-        and get_global_server_args().attn_cp_size <= 1
     )
-
-
-def _aiter_fused_ar_rmsnorm_supported(hidden_size: int, dtype: torch.dtype) -> bool:
-    """Check if aiter's fused allreduce+RMSNorm kernel supports the given shape."""
-    pack_size = 16 // dtype.itemsize
-    n_bytes = hidden_size * dtype.itemsize
-    return hidden_size % pack_size == 0 and 16 <= n_bytes <= 32768
 
 
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
@@ -129,99 +115,6 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and get_tensor_model_parallel_world_size() != 6
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_aiter_allreduce_fusion
-    )
-
-
-def _aiter_fused_ar_rmsnorm_supported(hidden_size: int, dtype: torch.dtype) -> bool:
-    """Check if aiter's fused allreduce+RMSNorm kernel supports the given shape.
-
-    The kernel requires hidden_size divisible by pack_size (8 for bf16/fp16,
-    4 for fp32) and n_bytes within [16, 32768].
-    """
-    pack_size = 16 // dtype.itemsize  # 8 for bf16/fp16, 4 for fp32
-    n_bytes = hidden_size * dtype.itemsize
-    return hidden_size % pack_size == 0 and 16 <= n_bytes <= 32768
-
-
-def _fused_ar_rmsnorm_fake(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    group_name: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(hidden_states), torch.empty_like(residual)
-
-
-@register_custom_op(
-    fake_impl=_fused_ar_rmsnorm_fake,
-)
-def fused_ar_rmsnorm(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    group_name: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Custom op wrapper for aiter's fused allreduce+residual+RMSNorm.
-
-    Registered as a custom op so dynamo treats it as opaque and doesn't
-    try to trace torch.cuda.is_current_stream_capturing() inside it.
-    """
-    ca_comm = get_tp_group().ca_comm
-    result = None
-    if ca_comm is not None and not getattr(ca_comm, "disabled", True) and hasattr(
-        ca_comm, "custom_fused_ar_rms"
-    ):
-        result = ca_comm.custom_fused_ar_rms(
-            hidden_states, residual, weight, eps,
-        )
-    if result is None:
-        # Custom AR unavailable or payload too large.
-        # Do a separate AllReduce + aiter's triton fused add+rmsnorm
-        # (still saves 2 kernels → 1 vs. unfused AR + add + rmsnorm).
-        from sglang.srt.distributed import tensor_model_parallel_all_reduce
-        from aiter import rmsnorm2d_fwd_with_add
-
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        output = torch.empty_like(hidden_states)
-        residual_out = torch.empty_like(residual)
-        rmsnorm2d_fwd_with_add(
-            output, hidden_states, residual, residual_out, weight, eps
-        )
-        return output, residual_out
-    return result
-
-
-def _try_aiter_fused_ar_rmsnorm(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    layernorm: torch.nn.Module,
-):
-    """Try aiter's fused allreduce+residual+RMSNorm kernel.
-
-    Returns (hidden_states, residual) on success, or None if not applicable
-    (unsupported shape, aiter not available, missing attrs).
-    """
-    if not _use_aiter:
-        return None
-    ca_comm = get_tp_group().ca_comm
-    if ca_comm is None:
-        return None
-    if not hasattr(layernorm, "weight") or not hasattr(
-        layernorm, "variance_epsilon"
-    ):
-        return None
-    if not _aiter_fused_ar_rmsnorm_supported(
-        hidden_states.shape[-1], hidden_states.dtype
-    ):
-        return None
-    return fused_ar_rmsnorm(
-        hidden_states,
-        residual,
-        layernorm.weight.data,
-        layernorm.variance_epsilon,
-        get_tp_group().unique_name,
     )
 
 
@@ -243,7 +136,6 @@ class ScatterMode(Enum):
         """The scatter mode for model forward pass input and output data"""
         if is_nsa_enable_prefill_cp():
             return ScatterMode.SCATTERED
-
         return ScatterMode.TP_ATTN_FULL
 
 
@@ -561,11 +453,11 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=True
+                            hidden_states, residual
                         )
                     )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -734,7 +626,6 @@ class LayerCommunicator:
             else 0
         )
 
-        # Primary fusion path (flashinfer or aiter-allreduce).
         if (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
@@ -750,10 +641,6 @@ class LayerCommunicator:
         ):
             return True
 
-        # Additional aiter-fused-AR+RMSNorm path (activated for TP>1 when
-        # custom-all-reduce is enabled and the payload fits in its max_size).
-        # Without this fallback, the above `return True` path is skipped when
-        # enable_aiter_allreduce_fusion is off, and we'd miss the fused kernel.
         if (
             _use_aiter
             and (not self.is_last_layer)
@@ -805,9 +692,7 @@ class CommunicateContext:
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
             # TODO: support --moe-dense-tp-size > 1
-            # With context parallel enabled, we should exclude
-            # the attn_cp_size from the total tp_size
-            ScatterMode.FULL: tp_size // attn_cp_size,
+            ScatterMode.FULL: tp_size,
         }
         return cls(
             process_group_sizes=process_group_sizes,
@@ -1007,14 +892,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=True
+                    hidden_states, residual
                 )
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
