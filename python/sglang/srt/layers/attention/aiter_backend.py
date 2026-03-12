@@ -2724,6 +2724,11 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
+            _has_fused_rope = (
+                _has_fused_rope_cache
+                and hasattr(layer, '_fused_rope_cos')
+                and not self.use_mla
+            )
             if _has_fused_rope:
                 # Fused path: apply RoPE and write to cache in one kernel
                 self._apply_fused_rope_and_cache(
