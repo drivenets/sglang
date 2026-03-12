@@ -1147,145 +1147,22 @@ class AiterAttnBackend(AttentionBackend):
                     fp8_prefill_kv_indices=fp8_prefill_kv_indices,
                 )
             else:
-                # For non-MLA extend with AITER mha_batch_prefill_func:
-                # - kv_indptr/kv_indices here point to PREFIX tokens for sliding window computation
-                # - forward_extend() computes all-token indices on the fly for the kernel call
-                
-                # Compute kv_indptr and kv_indices based on extend_prefix_lens
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_prefix_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                
-                prefix_lens_sum = sum(forward_batch.extend_prefix_lens_cpu)
-                kv_indices = torch.empty(
-                    prefix_lens_sum if prefix_lens_sum > 0 else 1,  # Avoid empty tensor issues
-                    dtype=torch.int64,
-                    device=self.device,
+                # Non-MLA extend: use indices_updater_prefill (matches upstream)
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=forward_batch.extend_prefix_lens,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=None,
                 )
-                if prefix_lens_sum > 0:
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.extend_prefix_lens,
-                        kv_indptr,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                    )
-                
-                max_extend_len = max(forward_batch.extend_seq_lens_cpu)
-                max_prefix_len = max(forward_batch.extend_prefix_lens_cpu) if forward_batch.extend_prefix_lens_cpu else 0
-                
-                # Compute sliding window buffers for extend if needed
-                # IMPORTANT: Use extend_prefix_lens (cached tokens), NOT seq_lens (total)
-                # For initial prefill with no cached tokens, extend_prefix_lens=0,
-                # so window_kv_indptr=[0,0] and window_kv_indices=[]
-                window_kv_indptr = None
-                window_kv_indices = None
-                window_kv_start_idx = None
-                if (
-                    self.sliding_window_size is not None
-                    and self.sliding_window_size > 0
-                ):
-                    # For extend, we only need window_kv_indptr and window_kv_indices
-                    # window_kv_offsets should be None (not used for extend)
-                    window_kv_indptr, window_kv_indices, _, _ = (
-                        update_sliding_window_buffer(
-                            self.window_kv_indptr,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            forward_batch.extend_prefix_lens,  # Use prefix lens, not seq_lens!
-                            forward_batch.req_pool_indices,
-                            bs,
-                            self.device,
-                            self.token_to_kv_pool_allocator,
-                        )
-                    )
-                    # Keep as int64 to match Triton's expectation
-
-                # --- Precompute KV indices for forward_extend (cached across all layers) ---
-                bs0 = bs + 1
-
-                # Full-attention indices: cumsum of seq_lens
-                seq_lens_local = forward_batch.seq_lens[:bs].to(self.device)
-                extend_full_kv_indptr = torch.empty(
-                    bs0, dtype=torch.int32, device=self.device
-                )
-                extend_full_kv_indptr[0] = 0
-                extend_full_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_local, dim=0)
-                extend_full_total_kv_len = int(extend_full_kv_indptr[bs].item())
-
-                extend_full_kv_indices = torch.empty(
-                    max(extend_full_total_kv_len, 1) + 256, dtype=torch.int32, device=self.device
-                )
-                if extend_full_total_kv_len > 0:
-                    create_flashinfer_kv_indices_triton[(bs,)](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        seq_lens_local,
-                        extend_full_kv_indptr,
-                        None,
-                        extend_full_kv_indices,
-                        self.req_to_token.stride(0),
-                    )
-                    extend_full_kv_indices[extend_full_total_kv_len:] = extend_full_kv_indices[0]
-
-                # SWA indices: window-limited, translated to SWA pool space
-                extend_swa_kv_indptr = None
-                extend_swa_kv_indices = None
-                extend_swa_total_kv_len = 0
-                if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                    swa_size = self.sliding_window_size
-                    swa_size_t = torch.tensor(swa_size, device=self.device)
-                    window_kv_lens = torch.minimum(seq_lens_local, swa_size_t)
-                    extend_swa_kv_indptr = torch.empty(
-                        bs0, dtype=torch.int32, device=self.device
-                    )
-                    extend_swa_kv_indptr[0] = 0
-                    extend_swa_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
-                    extend_swa_total_kv_len = int(extend_swa_kv_indptr[bs].item())
-
-                    extend_swa_kv_indices = torch.empty(
-                        max(extend_swa_total_kv_len, 1) + 256, dtype=torch.int64, device=self.device
-                    )
-                    if extend_swa_total_kv_len > 0:
-                        swa_window_kv_start_idx = seq_lens_local - window_kv_lens
-                        create_flashinfer_kv_indices_triton[(bs,)](
-                            self.req_to_token,
-                            forward_batch.req_pool_indices,
-                            window_kv_lens,
-                            extend_swa_kv_indptr,
-                            swa_window_kv_start_idx,
-                            extend_swa_kv_indices,
-                            self.req_to_token.stride(0),
-                        )
-                        # Translate full pool indices → SWA pool indices
-                        if hasattr(self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
-                            extend_swa_kv_indices[:extend_swa_total_kv_len] = (
-                                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                                    extend_swa_kv_indices[:extend_swa_total_kv_len]
-                                )
-                            )
-                        extend_swa_kv_indices[extend_swa_total_kv_len:] = extend_swa_kv_indices[0]
-                    # Convert to int32 for mha_batch_prefill_func
-                    extend_swa_kv_indices = extend_swa_kv_indices.to(torch.int32)
-
                 self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
                     None,
                     None,
-                    max_extend_len,
-                    max_prefix_len,
-                    window_kv_indptr=window_kv_indptr,
-                    window_kv_indices=window_kv_indices,
-                    window_kv_start_idx=None,  # Not used for extend
-                    extend_full_kv_indptr=extend_full_kv_indptr,
-                    extend_full_kv_indices=extend_full_kv_indices,
-                    extend_full_total_kv_len=extend_full_total_kv_len,
-                    extend_swa_kv_indptr=extend_swa_kv_indptr,
-                    extend_swa_kv_indices=extend_swa_kv_indices,
-                    extend_swa_total_kv_len=extend_swa_total_kv_len,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
                 )
 
     def init_cuda_graph_state(
@@ -2561,11 +2438,12 @@ class AiterAttnBackend(AttentionBackend):
                 sliding_window_size = -1
                 window_size = (-1, -1, 0)
 
-                # Extract attention sinks
+                # Extract attention sinks — strip nn.Parameter for aiter JIT
                 sinks = kwargs.get("sinks", None)
                 sink_ptr = None
                 if sinks is not None:
-                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+                    s = sinks.data if isinstance(sinks, torch.nn.Parameter) else sinks
+                    sink_ptr = s.to(torch.float32) if s.dtype != torch.float32 else s
 
                 # Compute cu_seqlens from static extend_seq_lens buffer (graph-safe)
                 cu_seqlens = self.cuda_graph_extend_qo_indptr
@@ -2607,11 +2485,12 @@ class AiterAttnBackend(AttentionBackend):
                 sliding_window_size = -1
                 window_size = (-1, -1)
 
-                # Extract attention sinks
+                # Extract attention sinks — strip nn.Parameter for aiter JIT
                 sinks = kwargs.get("sinks", None)
                 sink_ptr = None
                 if sinks is not None:
-                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+                    s = sinks.data if isinstance(sinks, torch.nn.Parameter) else sinks
+                    sink_ptr = s.to(torch.float32) if s.dtype != torch.float32 else s
 
                 # Use pre-allocated graph buffers (filled during replay_prepare)
                 cu_seqlens_q = self.cuda_graph_extend_qo_indptr[:bs0]
@@ -2767,13 +2646,23 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
+            # Ensure int32 for CK-tile kernel
+            _kv_indices = self.forward_metadata.kv_indices
+            if _kv_indices.dtype != torch.int32:
+                _kv_indices = _kv_indices.to(torch.int32)
+
+            _sink_ptr = None
+            if sinks is not None:
+                s = sinks.data if isinstance(sinks, torch.nn.Parameter) else sinks
+                _sink_ptr = s.to(torch.float32) if s.dtype != torch.float32 else s
+
             o_aiter = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
                 self.qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
+                _kv_indices,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,
                 causal=True,
@@ -2782,7 +2671,7 @@ class AiterAttnBackend(AttentionBackend):
                 return_lse=False,
                 return_attn_probs=False,
                 window_size=window_size,
-                sink_ptr=sinks,
+                sink_ptr=_sink_ptr,
             )
 
             return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -2922,12 +2811,11 @@ class AiterAttnBackend(AttentionBackend):
             sinks = kwargs.get("sinks", None)
             
             # Convert sinks to float32 if provided (kernel expects float32)
+            # Strip nn.Parameter wrapper — aiter JIT type checker requires plain tensors
             sink_ptr = None
             if sinks is not None:
-                if sinks.dtype != torch.float32:
-                    sink_ptr = sinks.to(torch.float32)
-                else:
-                    sink_ptr = sinks
+                s = sinks.data if isinstance(sinks, torch.nn.Parameter) else sinks
+                sink_ptr = s.to(torch.float32) if s.dtype != torch.float32 else s
 
             paged_attention_ragged(
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),

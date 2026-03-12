@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.radix_cache import (
     get_child_key,
     maybe_bigram_convert,
     page_align_keys,
+    split_node_hash_value,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
