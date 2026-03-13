@@ -180,6 +180,39 @@ def reg_all_gather_into_tensor(
     group._all_gather_into_tensor(output, input)
 
 
+def _fake_fused_ar_rms(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(input_), torch.empty_like(residual_inp_)
+
+
+@register_custom_op(fake_impl=_fake_fused_ar_rms)
+def fused_allreduce_rmsnorm_op(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    result = group.fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+    if result is None:
+        # Fallback: plain allreduce + fused_add_rmsnorm
+        input_ = group.all_reduce(input_)
+        from sgl_kernel import fused_add_rmsnorm
+
+        fused_add_rmsnorm(input_, residual_inp_, weight_.data, eps)
+        return input_, residual_inp_
+    return result
+
+
 @register_custom_op(mutates_args=["output"])
 def reg_reduce_scatter_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
