@@ -2550,97 +2550,50 @@ class AiterAttnBackend(AttentionBackend):
 
             # Check if we have prefix tokens to attend to
             extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
-            
-            
-            # For FP8 KV-cache, try native FP8 for no-prefix case
-            if self.kv_cache_dtype == fp8_dtype:
-                if extend_no_prefix:
-                    # Native FP8 path - no prefix, just new tokens
-                    cu_seqlens_local = torch.zeros(bs0, dtype=torch.int32, device=q.device)
-                    cu_seqlens_local[1:bs0] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
-                    max_seqlen = max(forward_batch.extend_seq_lens_cpu)
-                    
-                    # Reshape for attention
-                    q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                    k_view = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-                    v_view = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-                    
-                    # Dynamic scaling for FP8 conversion
-                    # FP8 E4M3 max is 448, use 400 as safe max to avoid edge cases
-                    fp8_safe_max = 400.0
-                    
-                    q_max = q_view.abs().max().item()
-                    k_max = k_view.abs().max().item()
-                    v_max = v_view.abs().max().item()
-                    
-                    # Compute scales (only scale if needed)
-                    q_scale = max(q_max / fp8_safe_max, 1.0)
-                    k_scale_val = max(k_max / fp8_safe_max, 1.0)
-                    v_scale_val = max(v_max / fp8_safe_max, 1.0)
-                    
-                    # Scale tensors before FP8 conversion
-                    if q_scale > 1.0:
-                        q_view = q_view / q_scale
-                    if k_scale_val > 1.0:
-                        k_view = k_view / k_scale_val
-                    if v_scale_val > 1.0:
-                        v_view = v_view / v_scale_val
-                    
-                    # Convert to FP8
-                    q_fp8 = q_view.to(fp8_dtype)
-                    k_fp8 = k_view.to(fp8_dtype)
-                    v_fp8 = v_view.to(fp8_dtype)
-                    
-                    # Create descale tensors for the kernel
-                    # descale values are MULTIPLIERS to dequantize FP8 values
-                    # If we scaled down by X before FP8 conversion, we need descale=X to scale back up
-                    # Note: q_descale and k_descale affect attention scores, v_descale affects output
-                    q_descale_dyn = torch.tensor([q_scale], dtype=torch.float32, device=q.device)
-                    k_descale_dyn = torch.tensor([k_scale_val], dtype=torch.float32, device=q.device)
-                    v_descale_dyn = torch.tensor([v_scale_val], dtype=torch.float32, device=q.device)
-                    
-                    o_fp8 = flash_attn_varlen_fp8_pertensor_func(
-                        q_fp8,
-                        k_fp8,
-                        v_fp8,
-                        q_descale_dyn,
-                        k_descale_dyn,
-                        v_descale_dyn,
-                        cu_seqlens_local,
-                        cu_seqlens_local,
-                        max_seqlen,
-                        max_seqlen,
-                        logits_soft_cap=self.logits_soft_cap if self.logits_soft_cap else 0.0,
-                        causal=True,
-                        softmax_scale=layer.scaling,
-                    )
-                    
-                    # Debug: Compare with BF16 reference for layer 0
-                    # Skip when max_seqlen=1 as BF16 kernel doesn't support it
-                    if layer.layer_id == 0 and not hasattr(self, '_fp8_debug_count'):
-                        self._fp8_debug_count = 0
-                    if layer.layer_id == 0 and self._fp8_debug_count < 3 and max_seqlen > 1:
-                        self._fp8_debug_count += 1
-                        # Run BF16 reference
-                        try:
-                            o_bf16 = flash_attn_varlen_func(
-                                q_view, k_view, v_view,
-                                cu_seqlens_local, cu_seqlens_local,
-                                max_seqlen, max_seqlen,
-                                softmax_scale=layer.scaling,
-                                causal=True,
-                            )
-                            cos_sim = torch.nn.functional.cosine_similarity(
-                                o_fp8.flatten().unsqueeze(0).float(),
-                                o_bf16.flatten().unsqueeze(0).float()
-                            ).item()
-                            logger.info(f"[FP8 Debug] Layer 0: FP8 vs BF16 cos_sim={cos_sim:.6f}, o_fp8 range=[{o_fp8.min():.4f}, {o_fp8.max():.4f}]")
-                        except Exception as e:
-                            logger.warning(f"[FP8 Debug] BF16 comparison failed: {e}")
-                    
-                    if layer.layer_id == 0:
-                        logger.info(f"[AITER DEBUG] FP8 no-prefix path output: o_fp8 min={o_fp8.min().item():.4f}, max={o_fp8.max().item():.4f}, mean={o_fp8.mean().item():.4f}")
-                    return o_fp8.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # Determine sliding window for window_size tuple
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                sliding_window_size = layer.sliding_window_size
+            else:
+                sliding_window_size = -1
+
+            # Extract attention sinks
+            sink_ptr = None
+            if sinks is not None:
+                s = sinks.data if isinstance(sinks, torch.nn.Parameter) else sinks
+                sink_ptr = s.to(torch.float32) if s.dtype != torch.float32 else s
+
+            # For no-prefix extends, use fresh BF16 Q/K/V with flash_attn_varlen_func.
+            # Works for both bf16 and FP8 KV cache — avoids reading from cache entirely.
+            if extend_no_prefix:
+                cu_seqlens = self.qo_indptr
+                cu_seqlens[1 : bs + 1] = torch.cumsum(
+                    forward_batch.extend_seq_lens, dim=0
+                )
+                cu_seqlens = cu_seqlens[:bs0]
+                max_len = max(forward_batch.extend_seq_lens_cpu)
+
+                q_view = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                )
+
+                win = (sliding_window_size, 0, 0) if sliding_window_size > 0 else (-1, -1, 0)
+
+                o = flash_attn_varlen_func(
+                    q_view,
+                    k,
+                    v,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_len,
+                    max_len,
+                    min_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=win,
+                    sink_ptr=sink_ptr,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             window_size = (-1, -1)
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:

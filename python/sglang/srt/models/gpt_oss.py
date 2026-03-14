@@ -378,10 +378,8 @@ class GptOssAttention(nn.Module):
             # attention layer so aiter_backend can use the fused
             # fused_qk_rope_reshape_and_cache kernel.
             rope = self.rotary_emb
-            cos_sin = rope.cos_sin_cache
-            rot_dim = cos_sin.shape[-1] // 2
-            self.attn._fused_rope_cos = cos_sin[..., :rot_dim]
-            self.attn._fused_rope_sin = cos_sin[..., rot_dim:]
+            self.attn._fused_rope_cos = rope.cos_cache
+            self.attn._fused_rope_sin = rope.sin_cache
             self.attn._fused_rope_is_neox = rope.is_neox_style
             self.attn._fused_rope_positions = positions
             # Don't apply RoPE here -- the backend will do it fused with KV cache write

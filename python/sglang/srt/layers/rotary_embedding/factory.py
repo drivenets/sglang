@@ -54,7 +54,16 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter.rotary_embedding import get_rope as aiter_get_rope
+    from aiter.rotary_embedding import get_rope as _aiter_get_rope_raw
+    from aiter.rotary_embedding import RotaryEmbedding as _AiterRE
+    class _AiterRotaryEmbeddingWrapper(_AiterRE):
+        def forward(self, positions, query, key=None, offsets=None,
+                    fused_set_kv_buffer_arg=None, **kw):
+            return super().forward(positions, query, key, offsets, **kw)
+    def aiter_get_rope(hs, rd, mp, b, neox=True, rs=None, dt=None, **kw):
+        r = _aiter_get_rope_raw(hs, rd, mp, b, neox, rs, dt)
+        r.__class__ = _AiterRotaryEmbeddingWrapper
+        return r
 
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
@@ -70,6 +79,9 @@ def get_rope(
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
 ) -> RotaryEmbedding:
+    if _use_aiter and dual_chunk_attention_config is None:
+        return aiter_get_rope(head_size, rotary_dim, max_position, base,
+                              is_neox_style, rope_scaling, dtype)
     if dtype is None:
         dtype = torch.get_default_dtype()
     if rope_scaling is not None:
