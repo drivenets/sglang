@@ -2113,9 +2113,14 @@ class AiterAttnBackend(AttentionBackend):
                         k_scale_val = self._fp8_k_scale_per_layer[lid].item()
                         v_scale_val = self._fp8_v_scale_per_layer[lid].item()
 
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
-                    )
+                    if self.use_mla:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                        )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -2684,9 +2689,14 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale_val = self._fp8_k_scale_per_layer[lid].item()
                     v_scale_val = self._fp8_v_scale_per_layer[lid].item()
 
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
-                )
+                if self.use_mla:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, v,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
+                    )
 
         if self.use_mla:
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)

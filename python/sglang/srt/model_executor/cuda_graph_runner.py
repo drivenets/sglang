@@ -652,6 +652,11 @@ class CudaGraphRunner:
         ):
             self.model_runner.model.set_eagle3_layers_to_capture()
 
+        # Pre-compile Triton kernels for dual-stream shapes on default stream.
+        # This avoids PassManager::run failures on ROCm when Triton compiles
+        # on a non-default alt_stream during CUDA graph capture.
+        self._precompile_dual_stream_kernels()
+
         # Capture
         try:
             with model_capture_mode():
@@ -660,6 +665,48 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _precompile_dual_stream_kernels(self):
+        """Pre-compile Triton kernels for all graph-capture batch sizes.
+
+        On ROCm, Triton's PassManager can crash when compiling concurrently
+        across TP ranks during CUDA graph capture. Pre-compile all needed
+        kernel variants sequentially on the default stream first.
+        """
+        model = self.model_runner.model
+        # Find shared expert MLP modules that use Triton GEMM
+        shared_expert_mlps = []
+        for module in model.modules():
+            if hasattr(module, 'shared_experts') and hasattr(module.shared_experts, 'gate_up_proj'):
+                shared_expert_mlps.append(module.shared_experts)
+                break  # All shared experts have same shapes, one is enough
+
+        if not shared_expert_mlps:
+            return
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Pre-compiling Triton kernels for shared expert MLP")
+
+        device = self.device
+        mlp = shared_expert_mlps[0]
+
+        # Pre-compile for each graph-capture batch size with barrier between ranks
+        for bs in self.model_runner.server_args.cuda_graph_bs:
+            num_tokens = bs * self.num_tokens_per_bs
+            try:
+                # Use zeros to avoid NaN issues
+                hidden_size = mlp.gate_up_proj.weight.shape[-1] if hasattr(mlp.gate_up_proj, 'weight') else 7168
+                dummy = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+                with torch.no_grad():
+                    _ = mlp(dummy)
+                torch.cuda.synchronize()
+            except Exception as e:
+                logger.warning(f"Pre-compile bs={bs}: {e}")
+            # Barrier to avoid concurrent compilations across TP ranks
+            self.model_runner.tp_group.barrier()
+
+        logger.info("Triton kernel pre-compilation complete")
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -1109,6 +1156,7 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,

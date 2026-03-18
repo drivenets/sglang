@@ -24,8 +24,6 @@ def store(bf16_ptr: int, fp8: torch.Tensor, scales: torch.Tensor):
 
 
 def fetch(input_tensor: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    global _cache_ptr
     if _cache_ptr != 0 and input_tensor.data_ptr() == _cache_ptr:
-        _cache_ptr = 0  # consume once
         return _cache_fp8, _cache_scales
     return None

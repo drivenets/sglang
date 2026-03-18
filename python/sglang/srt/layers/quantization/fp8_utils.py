@@ -744,6 +744,54 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+def aiter_w8a8_block_fp8_linear_cktile(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """CK-tile variant of aiter_w8a8_block_fp8_linear.
+
+    Uses CK-tile GEMM instead of Triton, avoiding CanonicalizePointers
+    MLIR pass failures on certain shapes (e.g. shared expert GEMMs).
+    """
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_cktile
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    if input_scale is not None:
+        q_input = input_2d
+        x_scale = input_scale
+    else:
+        try:
+            from sglang.srt.layers.quantization.fp8_pgquant_cache import fetch
+            _cached = fetch(input)
+            if _cached is not None:
+                q_input = _cached[0].view(-1, input.shape[-1])
+                x_scale = _cached[1]
+                input_scale = x_scale
+            else:
+                q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+        except Exception:
+            q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+
+    M, K = q_input.shape
+    N = weight.shape[0]
+    out_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    output = torch.empty(M, N, dtype=out_dtype, device=q_input.device)
+    gemm_a8w8_blockscale_cktile(q_input, weight, x_scale, weight_scale, output)
+
+    if bias is not None:
+        output += bias
+
+    return output.to(
+        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
+    ).view(*output_shape)
+
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

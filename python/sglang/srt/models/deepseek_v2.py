@@ -499,6 +499,13 @@ class DeepseekV2MoE(nn.Module):
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                     )
 
+            # Tag shared expert linear layers to use CK-tile GEMM instead of
+            # Triton. This avoids the CanonicalizePointers MLIR pass crash
+            # for these shapes, enabling dual-stream overlap on ROCm.
+            if _use_aiter and _is_gfx95_supported:
+                self.shared_experts.gate_up_proj._use_cktile_gemm = True
+                self.shared_experts.down_proj._use_cktile_gemm = True
+
         self.top_k = config.num_experts_per_tok
 
         if (
@@ -1688,7 +1695,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch,
+            quant_format=quant_format,
         )
 
         should_allreduce_fusion = (

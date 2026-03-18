@@ -716,8 +716,17 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            # Use CK-tile GEMM for layers tagged as shared experts
+            # (avoids Triton CanonicalizePointers MLIR bug on these shapes)
+            _gemm_fn = self.w8a8_block_fp8_linear
+            if getattr(layer, '_use_cktile_gemm', False):
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    aiter_w8a8_block_fp8_linear_cktile,
+                )
+                _gemm_fn = aiter_w8a8_block_fp8_linear_cktile
+
             if isinstance(x, tuple):
-                return self.w8a8_block_fp8_linear(
+                return _gemm_fn(
                     input=x[0],
                     weight=layer.weight,
                     block_size=self.quant_config.weight_block_size,
@@ -726,7 +735,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias=bias,
                 )
 
-            return self.w8a8_block_fp8_linear(
+            return _gemm_fn(
                 input=x,
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,

@@ -609,6 +609,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        quant_format: str = "",
     ):
         if cache is not None:
             self._context.cache = cache
@@ -619,6 +620,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             layernorm=self.post_attention_layernorm,
             context=self._context,
+            quant_format=quant_format,
         )
 
     def postprocess_layer(
@@ -892,6 +894,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        quant_format: str = "",
     ):
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
@@ -935,10 +938,35 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
-                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual
-                )
-                handled = True
+                if (
+                    _use_aiter
+                    and _is_gfx95_supported
+                    and "fp8" in quant_format
+                    and hidden_states.shape[-1] == 7168
+                    and hidden_states.shape[0] <= 80
+                    and hasattr(layernorm, "forward_with_allreduce_fusion_quant")
+                ):
+                    from sglang.srt.distributed.parallel_state import get_tp_group
+                    ca_comm = get_tp_group().ca_comm
+                    if (ca_comm is not None
+                        and not getattr(ca_comm, "disabled", True)
+                        and hasattr(ca_comm, "custom_fused_ar_rms_with_pgquant")
+                    ):
+                        result = ca_comm.custom_fused_ar_rms_with_pgquant(
+                            hidden_states, residual,
+                            layernorm.weight, layernorm.variance_epsilon,
+                        )
+                        if result is not None:
+                            bf16_out, residual, fp8_out, scales = result
+                            from sglang.srt.layers.quantization.fp8_pgquant_cache import store
+                            store(bf16_out.data_ptr(), fp8_out, scales)
+                            hidden_states = bf16_out
+                            handled = True
+                if not handled:
+                    hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                        hidden_states, residual
+                    )
+                    handled = True
 
             if not handled:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
