@@ -760,9 +760,19 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
-
     else:
-        q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+        # Check for pre-computed FP8+scales from fused AR+RMSNorm+quant
+        try:
+            from sglang.srt.layers.quantization.fp8_pgquant_cache import fetch
+            _cached = fetch(input)
+            if _cached is not None:
+                q_input = _cached[0].view(-1, input.shape[-1])
+                x_scale = _cached[1]
+                input_scale = x_scale  # ensure BF16 output
+            else:
+                q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
+        except Exception:
+            q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
     n, k = weight.shape
 

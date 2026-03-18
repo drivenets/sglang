@@ -347,6 +347,36 @@ class RMSNorm(MultiPlatformOp):
         return self.forward(x, residual, post_residual_addition)
 
 
+    def forward_with_allreduce_fusion_quant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fused AR + RMSNorm + per-group FP8 quantization.
+        Returns (out_fp8, residual) where out_fp8 has _sglang_fp8_group_scales attached."""
+        if residual is not None and _use_aiter:
+            from sglang.srt.distributed.parallel_state import get_tp_group
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+            if get_tensor_model_parallel_world_size() > 1:
+                tp_group = get_tp_group()
+                ca_comm = tp_group.ca_comm
+                if ca_comm is not None and not getattr(ca_comm, "disabled", True):
+                    if hasattr(ca_comm, "custom_fused_ar_rms_pgquant"):
+                        result = ca_comm.custom_fused_ar_rms_pgquant(
+                            x, residual, self.weight, self.variance_epsilon
+                        )
+                        if result is not None:
+                            out_fp8, residual_out, group_scales = result
+                            # Store scales in thread-local registry keyed by data_ptr
+                            from sglang.srt.layers.quantization.fp8_utils import _fp8_scale_cache
+                            _fp8_scale_cache[out_fp8.data_ptr()] = group_scales
+                            return out_fp8, residual_out
+
+        # Fallback: regular AR+RMSNorm, then separate quant
+        return self.forward_with_allreduce_fusion(x, residual)
+
+
 class LayerNorm(MultiPlatformOp):
     def __init__(
         self,

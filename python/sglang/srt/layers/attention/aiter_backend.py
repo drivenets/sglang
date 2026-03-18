@@ -293,6 +293,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
             self.enable_dp_attention = is_dp_attention_enabled()
+            global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
             # current mla_decode_fwd onln support fake-nps in self.num_head == 16
             # so all num_head size does not use qh16 kernel to simulate
@@ -1641,10 +1642,6 @@ class AiterAttnBackend(AttentionBackend):
         reduce_partial_map = None
 
         if forward_mode.is_decode_or_idle():
-            qo_indptr = None
-            kv_last_page_len = None
-            max_q_len = None
-
             if spec_info is None:
                 kv_indptr = self.kv_indptr
                 kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
@@ -1678,56 +1675,68 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
+            # For MLA decode replay: kv_indptr and kv_indices are updated in-place above
+            # (they're the same tensor objects captured in forward_metadata during graph capture).
+            # Only rebuild ForwardMetadata on first call; subsequent replays just need
+            # the in-place tensor updates + qo_indptr refresh.
             if self.use_mla:
+                # Update qo_indptr in-place (same tensor from graph capture)
                 qo_indptr = self.qo_indptr_[: bs + 1]
                 qo_indptr[1 : bs + 1] = torch.cumsum(
                     self.cuda_graph_kv_last_page_len[:bs], dim=0
                 )
-                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-                max_q_len = 1
 
-                if _use_mla_ps_kernel:
-                    num_kv_splits = self.max_split_per_batch
-
+                if self.forward_metadata is not None and not _use_mla_ps_kernel:
+                    # Non-persist replay: tensors updated in-place, skip rebuild.
+                    pass
+                elif self.forward_metadata is not None:
+                    # Persist replay: update work splits in-place.
+                    kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                     self.make_mla_meta_data(
-                        qo_indptr,
-                        kv_indptr,
-                        kv_last_page_len,
-                        self.work_metadata,
-                        self.work_info_set,
-                        self.work_indptr,
-                        self.reduce_indptr,
-                        self.reduce_final_map,
-                        self.reduce_partial_map,
-                        max_q_len,
-                        fast_mode=fast_mode,
-                        max_split_per_batch=num_kv_splits,
+                        qo_indptr, kv_indptr, kv_last_page_len,
+                        self.work_metadata, self.work_info_set, self.work_indptr,
+                        self.reduce_indptr, self.reduce_final_map, self.reduce_partial_map,
+                        1, fast_mode=fast_mode,
+                        max_split_per_batch=self.max_split_per_batch,
                         intra_batch_mode=intra_batch_mode,
                     )
+                else:
+                    # First call: full metadata build
+                    kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                    max_q_len = 1
+                    num_kv_splits = None
+                    work_metadata = None
+                    work_info_set = None
+                    work_indptr = None
+                    reduce_indptr = None
+                    reduce_final_map = None
+                    reduce_partial_map = None
 
-                    work_metadata = self.work_metadata
-                    work_info_set = self.work_info_set
-                    work_indptr = self.work_indptr
+                    if _use_mla_ps_kernel:
+                        num_kv_splits = self.max_split_per_batch
+                        self.make_mla_meta_data(
+                            qo_indptr, kv_indptr, kv_last_page_len,
+                            self.work_metadata, self.work_info_set, self.work_indptr,
+                            self.reduce_indptr, self.reduce_final_map, self.reduce_partial_map,
+                            max_q_len, fast_mode=fast_mode,
+                            max_split_per_batch=num_kv_splits,
+                            intra_batch_mode=intra_batch_mode,
+                        )
+                        work_metadata = self.work_metadata
+                        work_info_set = self.work_info_set
+                        work_indptr = self.work_indptr
+                        reduce_indptr = self.reduce_indptr
+                        reduce_final_map = self.reduce_final_map
+                        reduce_partial_map = self.reduce_partial_map
 
-                    reduce_indptr = self.reduce_indptr
-                    reduce_final_map = self.reduce_final_map
-                    reduce_partial_map = self.reduce_partial_map
-
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    kv_last_page_len,
-                    max_q_len,
-                    kv_indptr[-1].item(),
-                    work_metadata=work_metadata,
-                    work_info_set=work_info_set,
-                    work_indptr=work_indptr,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    num_kv_splits=num_kv_splits,
-                )
+                    self.forward_metadata = ForwardMetadata(
+                        kv_indptr, kv_indices, qo_indptr, kv_last_page_len,
+                        max_q_len, kv_indptr[-1].item(),
+                        work_metadata=work_metadata, work_info_set=work_info_set,
+                        work_indptr=work_indptr, reduce_indptr=reduce_indptr,
+                        reduce_final_map=reduce_final_map, reduce_partial_map=reduce_partial_map,
+                        num_kv_splits=num_kv_splits,
+                    )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -2653,9 +2662,9 @@ class AiterAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             _has_fused_rope = (
-                _has_fused_rope_cache
+                not self.use_mla
+                and _has_fused_rope_cache
                 and hasattr(layer, '_fused_rope_cos')
-                and not self.use_mla
             )
             if _has_fused_rope:
                 # Fused path: apply RoPE and write to cache in one kernel

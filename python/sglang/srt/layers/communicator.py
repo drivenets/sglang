@@ -458,11 +458,48 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    hidden_states, residual = (
-                        self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual
+                    if (
+                        _use_aiter
+                        and _is_gfx95_supported
+                        and "fp8" in quant_format
+                        and hidden_states.shape[-1] == 7168
+                        and hidden_states.shape[0] <= 80
+                    ):
+                        # Fused AR + RMSNorm + FP8 per-group quant (single kernel)
+                        from sglang.srt.distributed.parallel_state import get_tp_group
+                        ca_comm = get_tp_group().ca_comm
+                        if (ca_comm is not None
+                            and not getattr(ca_comm, "disabled", True)
+                            and hasattr(ca_comm, "custom_fused_ar_rms_with_pgquant")
+                        ):
+                            result = ca_comm.custom_fused_ar_rms_with_pgquant(
+                                hidden_states, residual,
+                                self.input_layernorm.weight,
+                                self.input_layernorm.variance_epsilon,
+                            )
+                            if result is not None:
+                                bf16_out, residual, fp8_out, scales = result
+                                from sglang.srt.layers.quantization.fp8_pgquant_cache import store
+                                store(bf16_out.data_ptr(), fp8_out, scales)
+                                hidden_states = bf16_out
+                            else:
+                                hidden_states, residual = (
+                                    self.input_layernorm.forward_with_allreduce_fusion(
+                                        hidden_states, residual
+                                    )
+                                )
+                        else:
+                            hidden_states, residual = (
+                                self.input_layernorm.forward_with_allreduce_fusion(
+                                    hidden_states, residual
+                                )
+                            )
+                    else:
+                        hidden_states, residual = (
+                            self.input_layernorm.forward_with_allreduce_fusion(
+                                hidden_states, residual
+                            )
                         )
-                    )
                 else:
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(

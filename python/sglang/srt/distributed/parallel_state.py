@@ -206,10 +206,14 @@ def fused_allreduce_rmsnorm_op(
     if result is None:
         # Fallback: plain allreduce + fused_add_rmsnorm
         input_ = group.all_reduce(input_)
-        from sgl_kernel import fused_add_rmsnorm
-
-        fused_add_rmsnorm(input_, residual_inp_, weight_.data, eps)
+        try:
+            from sgl_kernel import fused_add_rmsnorm
+            fused_add_rmsnorm(input_, residual_inp_, weight_.data, eps)
+        except (ImportError, AttributeError):
+            import aiter
+            aiter.add_rmsnorm(input_, residual_inp_, weight_.data, eps)
         return input_, residual_inp_
+
     return result
 
 
@@ -694,6 +698,7 @@ class GroupCoordinator:
                 2048,
                 2880,
                 4096,
+                7168,
             }
 
         fused_outputs = ca_comm.custom_fused_ar_rms(
