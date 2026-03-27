@@ -221,7 +221,7 @@ class ModelRunnerKVCacheMixin:
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
-                        device=self.device,
+                        device=getattr(self, 'tensor_device', self.device),
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         cache_params=config.mamba2_cache_params,
                         mamba_layer_ids=(
@@ -243,7 +243,7 @@ class ModelRunnerKVCacheMixin:
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
-                        device=self.device,
+                        device=getattr(self, 'tensor_device', self.device),
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
@@ -254,7 +254,7 @@ class ModelRunnerKVCacheMixin:
                     mamba_spec_state_size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     cache_params=config.mamba2_cache_params,
                     mamba_layer_ids=(
@@ -274,7 +274,7 @@ class ModelRunnerKVCacheMixin:
                     size=max_num_reqs,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                 )
         else:
@@ -332,7 +332,7 @@ class ModelRunnerKVCacheMixin:
                         self.model_config.index_head_dim if is_nsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -351,7 +351,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     head_dim=self.model_config.head_dim,
                     layer_num=self.num_effective_layers,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -364,7 +364,7 @@ class ModelRunnerKVCacheMixin:
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.num_effective_layers,
-                device=self.device,
+                device=getattr(self, 'tensor_device', self.device),
                 kv_cache_dim=self.calculate_mla_kv_cache_dim(),
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
@@ -391,7 +391,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     layer_num=self.num_effective_layers,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -404,7 +404,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     layer_num=self.num_effective_layers,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -417,7 +417,7 @@ class ModelRunnerKVCacheMixin:
                 head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.num_effective_layers,
-                device=self.device,
+                device=getattr(self, 'tensor_device', self.device),
                 heavy_channel_num=self.server_args.ds_heavy_channel_num,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
@@ -449,7 +449,7 @@ class ModelRunnerKVCacheMixin:
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     **kwargs,
                 )
             elif config := self.mambaish_config:
@@ -478,7 +478,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_kvcache_transpose=False,
-                    device=self.device,
+                    device=getattr(self, 'tensor_device', self.device),
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     use_mla=self.use_mla_backend,
@@ -496,7 +496,7 @@ class ModelRunnerKVCacheMixin:
                         ),
                         head_dim=self.model_config.head_dim,
                         layer_num=self.num_effective_layers,
-                        device=self.device,
+                        device=getattr(self, 'tensor_device', self.device),
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
@@ -515,7 +515,7 @@ class ModelRunnerKVCacheMixin:
                         ),
                         head_dim=self.model_config.head_dim,
                         layer_num=self.num_effective_layers,
-                        device=self.device,
+                        device=getattr(self, 'tensor_device', self.device),
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
@@ -551,7 +551,7 @@ class ModelRunnerKVCacheMixin:
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
-                        device=self.device,
+                        device=getattr(self, 'tensor_device', self.device),
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
                     )
@@ -562,7 +562,7 @@ class ModelRunnerKVCacheMixin:
                         self.swa_max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
-                        device=self.device,
+                        device=getattr(self, 'tensor_device', self.device),
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
                     )
@@ -588,7 +588,7 @@ class ModelRunnerKVCacheMixin:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
-                            device=self.device,
+                            device=getattr(self, 'tensor_device', self.device),
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
@@ -597,7 +597,7 @@ class ModelRunnerKVCacheMixin:
                             self.max_total_num_tokens,
                             page_size=self.page_size,
                             dtype=self.kv_cache_dtype,
-                            device=self.device,
+                            device=getattr(self, 'tensor_device', self.device),
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )

@@ -320,7 +320,7 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
-    def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
+    def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size, device="cuda"):
         nhead = self.num_head_padded
         dtype = self.kv_cache_dtype
 
@@ -354,24 +354,24 @@ class AiterAttnBackend(AttentionBackend):
         # aiter implementation
         # the tensor's meaning please refer aiter/ops/attention.py
         work_metadata = torch.empty(
-            work_meta_data_size, dtype=work_meta_data_type, device="cuda"
+            work_meta_data_size, dtype=work_meta_data_type, device=device
         )
         work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_type, device="cuda"
+            work_indptr_size, dtype=work_indptr_type, device=device
         )
         work_info_set = torch.empty(
             work_info_set_size,
             dtype=work_info_set_type,
-            device="cuda",
+            device=device,
         )
         reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_type, device="cuda"
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
         )
         reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device="cuda"
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
         )
         reduce_partial_map = torch.empty(
-            reduce_partial_map_size, dtype=reduce_partial_map_type, device="cuda"
+            reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
         )
 
         return (
@@ -793,7 +793,7 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr,
                         reduce_final_map,
                         reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_q_len, bs)
+                    ) = self.make_mla_decode_meta_data_buffer(max_q_len, bs, device=self.device)
 
                     num_kv_splits = self.max_split_per_batch
 
@@ -865,7 +865,7 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr,
                         reduce_final_map,
                         reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs, device=self.device)
 
                     num_kv_splits = self.max_split_per_batch
 
@@ -1041,7 +1041,7 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr,
                         reduce_final_map,
                         reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+                    ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs, device=self.device)
 
                     num_kv_splits = self.max_split_per_batch
 
@@ -1306,7 +1306,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.reduce_indptr,
                 self.reduce_final_map,
                 self.reduce_partial_map,
-            ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs)
+            ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, max_bs, device=self.device)
 
         else:
             self.work_metadata = None

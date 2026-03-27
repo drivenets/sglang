@@ -315,6 +315,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.gpu_id = gpu_id
+        # Explicit device for tensor allocation (prevents HIP/ROCm current_device confusion in TP disagg)
+        self.tensor_device = f"cuda:{gpu_id}" if server_args.device == "cuda" else server_args.device
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank
@@ -453,6 +455,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Get available memory before model loading
         pre_model_load_memory = self.init_torch_distributed()
+
+        # Re-set CUDA device after distributed init (NCCL init can change current device)
+        if self.device == "cuda":
+            torch.cuda.set_device(self.gpu_id)
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
@@ -2029,7 +2035,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
-        device = "cuda"
+        device = self.tensor_device
         a = torch.ones((16, 16), dtype=dtype, device=device)
         b = torch.ones((16, 16), dtype=dtype, device=device)
         c = a @ b

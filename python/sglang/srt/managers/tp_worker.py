@@ -283,7 +283,7 @@ class TpModelWorker(BaseTpWorker):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-        self.device = self.model_runner.device
+        self.device = getattr(self.model_runner, 'tensor_device', self.model_runner.device)
 
         # Init nccl groups
         self.pp_group = get_pp_group()

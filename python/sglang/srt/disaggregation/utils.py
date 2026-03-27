@@ -140,6 +140,7 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        gpu_id: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
         bootstrap_room_dtype = torch.uint64
@@ -153,7 +154,7 @@ class MetadataBuffers:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
         elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
-            device = "cuda"
+            device = f"cuda:{gpu_id}"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool

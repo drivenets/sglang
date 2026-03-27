@@ -1068,6 +1068,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                gpu_id=self.gpu_id,
             )
 
             # The decode requests polling kv cache
@@ -1123,6 +1124,7 @@ class Scheduler(
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                gpu_id=self.gpu_id,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -3723,6 +3725,11 @@ def run_scheduler_process(
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
+
+    # Set CUDA device for this scheduler process
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
 
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
