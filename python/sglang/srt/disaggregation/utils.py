@@ -141,6 +141,7 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
         gpu_id: int = 0,
+        num_layers: int = 0,
     ):
         self.custom_mem_pool = custom_mem_pool
         bootstrap_room_dtype = torch.uint64
@@ -194,6 +195,12 @@ class MetadataBuffers:
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
+            # FP8 KV cache per-layer scales: [k_scale_0, v_scale_0, k_scale_1, v_scale_1, ...]
+            # num_layers * 2 float32 values. Pad to at least 64 bytes (RDMA min).
+            fp8_scale_count = max(num_layers * 2, 16)  # at least 16 float32 = 64 bytes
+            self.fp8_kv_scales = torch.zeros(
+                (size, fp8_scale_count), dtype=torch.float32, device=device
+            )
 
     def get_buf_infos(self):
         ptrs = [
@@ -207,6 +214,7 @@ class MetadataBuffers:
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
             self.bootstrap_room.data_ptr(),
+            self.fp8_kv_scales.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -219,6 +227,7 @@ class MetadataBuffers:
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
             self.bootstrap_room.nbytes,
+            self.fp8_kv_scales.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -231,6 +240,7 @@ class MetadataBuffers:
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
+            self.fp8_kv_scales[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -246,6 +256,7 @@ class MetadataBuffers:
             self.output_topk_index[idx],
             self.output_hidden_states[idx],
             self.bootstrap_room[idx],
+            self.fp8_kv_scales[idx],
         )
 
     def set_buf(self, req: Req):
@@ -295,6 +306,18 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+        # FP8 KV scales: copy from attention backend if available
+        if hasattr(self, '_fp8_scales_src') and self._fp8_scales_src is not None:
+            self.fp8_kv_scales[req.metadata_buffer_index].copy_(self._fp8_scales_src)
+
+    def set_fp8_kv_scales_source(self, k_scales: "torch.Tensor", v_scales: "torch.Tensor"):
+        """Set the FP8 KV scale source tensors (from attention backend).
+        Called once after scales are calibrated. Interleaves k and v scales."""
+        num_layers = k_scales.shape[0]
+        scales = torch.zeros(self.fp8_kv_scales.shape[1], dtype=torch.float32)
+        scales[:num_layers * 2:2] = k_scales.cpu()
+        scales[1:num_layers * 2:2] = v_scales.cpu()
+        self._fp8_scales_src = scales
 
 
 #########################

@@ -1069,6 +1069,7 @@ class Scheduler(
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 gpu_id=self.gpu_id,
+                num_layers=self.model_config.num_hidden_layers,
             )
 
             # The decode requests polling kv cache
@@ -1125,6 +1126,7 @@ class Scheduler(
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 gpu_id=self.gpu_id,
+                num_layers=self.model_config.num_hidden_layers,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

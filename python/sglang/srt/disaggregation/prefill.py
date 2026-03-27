@@ -770,6 +770,16 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
+            # Transfer FP8 KV scales if using FP8 KV cache
+            if not hasattr(self.disagg_metadata_buffers, '_fp8_scales_src') or self.disagg_metadata_buffers._fp8_scales_src is None:
+                attn_backend = getattr(self.tp_worker, '_model_runner', None)
+                if attn_backend is not None:
+                    attn_backend = getattr(attn_backend, 'attn_backend', None)
+                if attn_backend is not None and hasattr(attn_backend, '_fp8_k_scale_per_layer'):
+                    self.disagg_metadata_buffers.set_fp8_kv_scales_source(
+                        attn_backend._fp8_k_scale_per_layer,
+                        attn_backend._fp8_v_scale_per_layer,
+                    )
             self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models

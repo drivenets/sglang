@@ -973,6 +973,7 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
             output_bootstrap_room,
+            fp8_kv_scales,
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
@@ -1010,6 +1011,10 @@ class DecodeTransferQueue:
             return True
 
         # Case 3: Success - commit the transfer
+        # Apply FP8 KV scales from prefill if present
+        if fp8_kv_scales is not None and fp8_kv_scales.abs().sum() > 0:
+            self._apply_fp8_kv_scales(fp8_kv_scales)
+
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
@@ -1054,6 +1059,28 @@ class DecodeTransferQueue:
             kv_manager, self.scheduler, self.tp_rank
         )
         kv_manager._staging_handler = self.staging_handler
+
+    def _apply_fp8_kv_scales(self, fp8_kv_scales: "torch.Tensor"):
+        """Apply FP8 KV scales received from prefill to decode attention backend."""
+        if hasattr(self, '_fp8_scales_applied') and self._fp8_scales_applied:
+            return  # Only need to apply once (scales are per-model, not per-request)
+        attn_backend = getattr(self.scheduler, 'tp_worker', None)
+        if attn_backend is not None:
+            attn_backend = getattr(attn_backend, '_model_runner', None)
+        if attn_backend is not None:
+            attn_backend = getattr(attn_backend, 'attn_backend', None)
+        if attn_backend is not None and hasattr(attn_backend, '_fp8_k_scale_per_layer'):
+            import torch
+            num_layers = attn_backend._fp8_k_scale_per_layer.shape[0]
+            k_scales = fp8_kv_scales[:num_layers * 2:2]
+            v_scales = fp8_kv_scales[1:num_layers * 2:2]
+            if k_scales.abs().sum() > 0:  # Only apply if scales are non-zero
+                attn_backend._fp8_k_scale_per_layer.copy_(k_scales.to(attn_backend._fp8_k_scale_per_layer.device))
+                attn_backend._fp8_v_scale_per_layer.copy_(v_scales.to(attn_backend._fp8_v_scale_per_layer.device))
+                attn_backend._fp8_scales_calibrated = [True] * num_layers
+                logger.info(f"Applied FP8 KV scales from prefill: k_scale[0]={k_scales[0].item():.6f}, v_scale[0]={v_scales[0].item():.6f}")
+                self._fp8_scales_applied = True
+
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
