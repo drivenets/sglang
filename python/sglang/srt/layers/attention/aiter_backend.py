@@ -2756,7 +2756,6 @@ class AiterAttnBackend(AttentionBackend):
                 sliding_window_size = -1
 
             # Extract attention sinks (GPT-OSS uses learned per-head sink params)
-            sinks = kwargs.get("sinks", None)
             sink_ptr = None
             if sinks is not None:
                 sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks

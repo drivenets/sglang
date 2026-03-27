@@ -29,7 +29,5 @@ def clamp_position_cuda(seq_lens: torch.Tensor) -> torch.Tensor:
 
     Supported dtypes: torch.int32, torch.int64.
     """
-    dst = torch.empty_like(seq_lens)
-    module = _jit_clamp_position_module(seq_lens.dtype)
-    module.clamp_position(dst, seq_lens)
-    return dst
+    # Pure PyTorch fallback (avoids tvm_ffi JIT on ROCm)
+    return torch.clamp(seq_lens - 1, min=0)
