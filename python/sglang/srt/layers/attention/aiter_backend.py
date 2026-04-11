@@ -2195,10 +2195,23 @@ class AiterAttnBackend(AttentionBackend):
         # k and v are already 3D from RadixAttention.forward: (T, KH, D)
 
         # Get cos/sin from the stored RoPE info
-        cos_cache = layer._fused_rope_cos   # (max_pos, 1, 1, D//2)
-        sin_cache = layer._fused_rope_sin   # (max_pos, 1, 1, D//2)
+        cos_cache = layer._fused_rope_cos   # (max_pos, D//2)
+        sin_cache = layer._fused_rope_sin   # (max_pos, D//2)
         is_neox = layer._fused_rope_is_neox
         positions = layer._fused_rope_positions[:num_tokens]
+
+        # Debug: compare fused kernel output vs reference RoPE
+        if not hasattr(self, '_fused_rope_debug_count'):
+            self._fused_rope_debug_count = 0
+        _do_rope_debug = self._fused_rope_debug_count < 3
+        if _do_rope_debug:
+            self._fused_rope_debug_count += 1
+            _q_pre = q_3d.clone()
+            _k_pre = k.clone()
+            _dbg_positions = positions.clone()
+            _dbg_cos = cos_cache
+            _dbg_sin = sin_cache
+            _dbg_layer_id = layer.layer_id
 
         # For SWA layers, get_key_buffer returns the SWA pool (smaller than full).
         # cache_loc is in full pool space — translate to SWA space so the fused
@@ -2209,9 +2222,9 @@ class AiterAttnBackend(AttentionBackend):
         if (
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
-            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
+            and hasattr(forward_batch.token_to_kv_pool, "full_to_swa_index_mapping")
         ):
-            mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+            mapping = forward_batch.token_to_kv_pool.full_to_swa_index_mapping
             cache_loc = mapping[cache_loc].long()
 
         # Get KV cache buffers and reshape for flash_layout (block_size=1)
@@ -2292,6 +2305,34 @@ class AiterAttnBackend(AttentionBackend):
             output_zeros=False,
         )
 
+        # Debug: compare fused output vs reference
+        if _do_rope_debug:
+            # Reference NeoX-style RoPE
+            rot_d = _dbg_cos.shape[-1]
+            def _ref(x, cos_c, sin_c, pos):
+                x1 = x[..., :rot_d]
+                x2 = x[..., rot_d:rot_d*2]
+                c = cos_c[pos].unsqueeze(1)
+                s = sin_c[pos].unsqueeze(1)
+                return torch.cat([x1*c - x2*s, x2*c + x1*s], dim=-1)
+
+            q_ref = _ref(_q_pre, _dbg_cos, _dbg_sin, _dbg_positions)
+            k_ref = _ref(_k_pre, _dbg_cos, _dbg_sin, _dbg_positions)
+            q_diff = (q_3d[..., :rot_d*2].float() - q_ref.float()).abs().max().item()
+            k_diff = (k[..., :rot_d*2].float() - k_ref.float()).abs().max().item()
+            with open('/tmp/FUSED_ROPE_DEBUG.txt', 'a') as _f:
+                _f.write(
+                    f"call={self._fused_rope_debug_count} layer={_dbg_layer_id} "
+                    f"q_maxdiff={q_diff:.6f} k_maxdiff={k_diff:.6f} "
+                    f"q_shape={tuple(q_3d.shape)} k_shape={tuple(k.shape)}\n"
+                    f"  q_pre[0,0,:4]={_q_pre[0,0,:4].tolist()}\n"
+                    f"  q_fus[0,0,:4]={q_3d[0,0,:4].tolist()}\n"
+                    f"  q_ref[0,0,:4]={q_ref[0,0,:4].tolist()}\n"
+                    f"  k_pre[0,0,:4]={_k_pre[0,0,:4].tolist()}\n"
+                    f"  k_fus[0,0,:4]={k[0,0,:4].tolist()}\n"
+                    f"  k_ref[0,0,:4]={k_ref[0,0,:4].tolist()}\n"
+                )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -2318,6 +2359,23 @@ class AiterAttnBackend(AttentionBackend):
 
         if k is not None:
             assert v is not None
+            # Debug: probe the fused RoPE condition
+            if not hasattr(self, '_extend_probe_done'):
+                self._extend_probe_done = True
+                with open('/tmp/FUSED_ROPE_PROBE.txt', 'w') as _pf:
+                    _pf.write(
+                        f"save_kv_cache={save_kv_cache}\n"
+                        f"_has_fused_rope_cache={_has_fused_rope_cache}\n"
+                        f"hasattr_cos={hasattr(layer, '_fused_rope_cos')}\n"
+                        f"cos_not_none={getattr(layer, '_fused_rope_cos', 'MISSING') is not None}\n"
+                        f"layer_type={type(layer).__name__}\n"
+                    )
+            if save_kv_cache:
+                # Apply fused RoPE + KV cache write if deferred from model
+                if _has_fused_rope_cache and hasattr(layer, '_fused_rope_cos') and layer._fused_rope_cos is not None:
+                    self._apply_fused_rope_and_cache(q, k, v, layer, forward_batch, cache_loc, is_extend=True)
+                    save_kv_cache = False
+
             if save_kv_cache:
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
@@ -2871,6 +2929,12 @@ class AiterAttnBackend(AttentionBackend):
         if self.kv_cache_dtype == fp8_dtype:
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
             v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
+
+        if save_kv_cache:
+            # Apply fused RoPE + KV cache write if deferred from model
+            if _has_fused_rope_cache and hasattr(layer, '_fused_rope_cos') and layer._fused_rope_cos is not None:
+                self._apply_fused_rope_and_cache(q, k, v, layer, forward_batch, forward_batch.out_cache_loc, is_extend=False)
+                save_kv_cache = False
 
         if save_kv_cache:
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when

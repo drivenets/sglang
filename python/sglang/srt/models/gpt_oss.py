@@ -109,7 +109,7 @@ else:
 from sglang.srt.utils import get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_fused_rope_cache = _use_aiter  # Fused RoPE + KV cache write
+_use_fused_rope_cache = False  # Disabled: debugging garbled output
 
 if _use_fused_rope_cache:
     try:
@@ -410,7 +410,7 @@ class GptOssAttention(nn.Module):
             # Don't apply RoPE here -- the backend will do it fused with KV cache write
         else:
             extra_args = {}
-            if not _is_npu:
+            if not _is_npu:  # sgl_kernel not available on HIP
                 extra_args = {
                     "fused_set_kv_buffer_arg": (
                         create_fused_set_kv_buffer_arg(
@@ -434,7 +434,7 @@ class GptOssAttention(nn.Module):
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=_use_fused_rope_cache or not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
         return output

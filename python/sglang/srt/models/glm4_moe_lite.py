@@ -20,7 +20,10 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from sgl_kernel import dsv3_router_gemm
+try:
+    from sgl_kernel import dsv3_router_gemm
+except ImportError:
+    dsv3_router_gemm = None
 from torch import nn
 from transformers import PretrainedConfig
 

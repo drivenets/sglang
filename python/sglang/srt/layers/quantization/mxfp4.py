@@ -115,7 +115,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = _is_hip  # CK MXFP4 fused_moe enabled on gfx950 (Swiglu no-bias fix applied)
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 if _is_hip:
@@ -312,6 +312,10 @@ class Mxfp4Config(QuantizationConfig):
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
 
+    # FP4 E2M1 lookup table for dequantization
+    _FP4_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
     def __init__(
         self,
         prefix: str,
@@ -326,6 +330,75 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
+        self._use_bf16_dequant = False
+
+    @staticmethod
+    def _dequant_block(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Dequantize MXFP4 packed uint8 blocks + E8M0 scales to bf16.
+
+        blocks: (E, out_dim, n_blocks, 16) uint8 — each byte holds 2 FP4 values
+        scales: (E, out_dim, n_blocks) uint8 — E8M0 exponent per 32-element block
+        Returns: (E, out_dim, n_blocks * 32) bf16
+        """
+        lut = torch.tensor(Mxfp4MoEMethod._FP4_LUT, dtype=torch.float32, device=blocks.device)
+        E, out_dim, n_blocks, bsize = blocks.shape  # bsize=16
+
+        # Unpack low/high nibbles
+        lo = (blocks & 0xF).long()      # (E, out, nblk, 16)
+        hi = (blocks >> 4).long()       # (E, out, nblk, 16)
+
+        # Lookup FP4 values
+        lo_vals = lut[lo]               # (E, out, nblk, 16) float32
+        hi_vals = lut[hi]               # (E, out, nblk, 16) float32
+
+        # Interleave: [lo0, hi0, lo1, hi1, ...] -> (E, out, nblk, 32)
+        result = torch.stack([lo_vals, hi_vals], dim=-1).reshape(E, out_dim, n_blocks, bsize * 2)
+
+        # Apply E8M0 scales: 2^(byte - 127)
+        e8m0_float = torch.pow(2.0, scales.float() - 127.0)  # (E, out, nblk)
+        result = result * e8m0_float.unsqueeze(-1)            # broadcast over 32 elements
+
+        return result.reshape(E, out_dim, -1).to(torch.bfloat16)
+
+    def _dequant_mxfp4_to_bf16(self, layer):
+        """Dequantize MXFP4 weights to bf16 in-place, replacing packed weights with full bf16."""
+        self._use_bf16_dequant = True
+
+        # w13: (E, 2*inter, hidden//2) uint8 packed + (E, 2*inter, hidden//32) scales
+        # Need to reshape to (E, 2*inter, n_blocks, 16) for dequant
+        w13 = layer.w13_weight.data  # (E, 2*inter, hidden//2)
+        w13_sc = layer.w13_weight_scale.data  # (E, 2*inter, hidden//32)
+        E, out13, k_packed = w13.shape
+        n_blocks = w13_sc.shape[-1]
+
+        # NOTE: gate/up swap NOT applied here — the checkpoint stores
+        # gate and up interleaved per expert, and the custom Swiglu
+        # activation expects this ordering directly.
+
+        w13_blocks = w13.reshape(E, out13, n_blocks, k_packed // n_blocks)
+
+        w13_bf16 = self._dequant_block(w13_blocks, w13_sc)
+        log_info_on_rank0(logger, f"[AITER] Dequantized w13: {tuple(w13.shape)} -> {tuple(w13_bf16.shape)}")
+
+        # w2: same treatment
+        w2 = layer.w2_weight.data
+        w2_sc = layer.w2_weight_scale.data
+        _, out2, k2_packed = w2.shape
+        n_blocks2 = w2_sc.shape[-1]
+        w2_blocks = w2.reshape(E, out2, n_blocks2, k2_packed // n_blocks2)
+
+        w2_bf16 = self._dequant_block(w2_blocks, w2_sc)
+        log_info_on_rank0(logger, f"[AITER] Dequantized w2: {tuple(w2.shape)} -> {tuple(w2_bf16.shape)}")
+
+        # Replace weights with bf16 versions
+        layer.w13_weight = Parameter(w13_bf16, requires_grad=False)
+        layer.w2_weight = Parameter(w2_bf16, requires_grad=False)
+
+        # Biases to float32
+        if layer.w13_weight_bias is not None:
+            layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(torch.float32)
+        if layer.w2_weight_bias is not None:
+            layer.w2_weight_bias.data = layer.w2_weight_bias.data.to(torch.float32)
 
     def create_weights(
         self,
@@ -1068,8 +1141,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else:
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
-
-            origi_hidden_size = self.hidden_size - self.hidden_pad
 
             x = torch.nn.functional.pad(
                 x,

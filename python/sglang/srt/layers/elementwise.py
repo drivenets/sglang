@@ -201,7 +201,6 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
-    # Use AITER if available (3.85x faster per norm)
     if _use_aiter and _aiter_available:
         # AITER's fused function: add residual + normalize twice
         residual_out = torch.empty_like(x)
@@ -279,7 +278,6 @@ def fused_rmsnorm_kernel(
 
 
 def fused_rmsnorm(x, weight, eps, autotune=False, inplace=False):
-    # Use AITER if available (3.85x faster)
     if _use_aiter and _aiter_available:
         return aiter.rmsnorm2d_fwd(x, weight, epsilon=eps)
     

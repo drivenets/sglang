@@ -83,7 +83,13 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
+elif _is_hip:
+    try:
+        from sgl_kernel import moe_fused_gate
+    except ImportError:
+        moe_fused_gate = None
 
+if _is_cuda:
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
 
@@ -125,7 +131,10 @@ if _is_cuda:
         pass
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import topk_softmax
+    try:
+        from sgl_kernel import topk_softmax
+    except ImportError:
+        topk_softmax = None
 
     try:
         from sgl_kernel import topk_sigmoid

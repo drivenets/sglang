@@ -168,9 +168,6 @@ def fused_ar_rmsnorm(
         from sglang.srt.distributed import tensor_model_parallel_all_reduce
 
         hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        # Use AITER's triton fused add+rmsnorm (sgl_kernel's C++ version
-        # is not available on ROCm -- torch.ops.sgl_kernel.fused_add_rmsnorm
-        # is not registered).
         from aiter import rmsnorm2d_fwd_with_add
 
         output = torch.empty_like(hidden_states)

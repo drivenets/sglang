@@ -46,7 +46,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
 )
-from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.utils import get_hash_str, hash_str_to_int64
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,

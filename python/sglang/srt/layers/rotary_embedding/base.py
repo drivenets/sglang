@@ -85,12 +85,16 @@ class RotaryEmbedding(MultiPlatformOp):
             if _is_cuda:
                 from sglang.jit_kernel.rope import rotary_embedding
             elif _is_hip:
-                from sgl_kernel import rotary_embedding
+                try:
+                    from sgl_kernel import rotary_embedding
+                except ImportError:
+                    rotary_embedding = None
             else:
                 from vllm._custom_ops import rotary_embedding
 
-            self.use_fallback_kernel = True
-            self.fallback_rotary_embedding = rotary_embedding
+            self.use_fallback_kernel = rotary_embedding is not None
+            if self.use_fallback_kernel:
+                self.fallback_rotary_embedding = rotary_embedding
         else:
             self.use_fallback_kernel = False
 

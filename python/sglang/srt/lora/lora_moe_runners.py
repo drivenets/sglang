@@ -50,10 +50,17 @@ _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 
 
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    try:
+        from sgl_kernel import gelu_and_mul, silu_and_mul
+    except ImportError:
+        gelu_and_mul = None
+        silu_and_mul = None
 
     if _is_hip:
-        from vllm import _custom_ops as vllm_ops  # moe_sum
+        try:
+            from vllm import _custom_ops as vllm_ops  # moe_sum
+        except ImportError:
+            vllm_ops = None
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_xpu:
@@ -61,9 +68,12 @@ elif _is_xpu:
 
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sgl_kernel import (  # noqa: F401
-        moe_align_block_size as sgl_moe_align_block_size,
-    )
+    try:
+        from sgl_kernel import (  # noqa: F401
+            moe_align_block_size as sgl_moe_align_block_size,
+        )
+    except ImportError:
+        sgl_moe_align_block_size = None
 
     from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
 

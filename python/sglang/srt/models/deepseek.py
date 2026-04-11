@@ -54,7 +54,10 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 if _is_cpu and _is_cpu_amx_available:
-    import sgl_kernel  # noqa: F401
+    try:
+        import sgl_kernel  # noqa: F401
+    except ImportError:
+        pass
 
 
 class DeepseekMLP(nn.Module):

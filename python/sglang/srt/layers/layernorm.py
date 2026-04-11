@@ -72,8 +72,8 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
-    _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
-    _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
+    _has_aiter_layer_norm = True
+    _has_vllm_rms_norm = True
 elif _is_hip:
     try:
         from vllm._custom_ops import fused_add_rms_norm, rms_norm
@@ -174,7 +174,7 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if _use_aiter:
+        if _use_aiter and _has_vllm_rms_norm:
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
