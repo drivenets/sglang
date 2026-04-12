@@ -115,7 +115,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_use_aiter = _is_hip  # CK MXFP4 fused_moe enabled on gfx950 (Swiglu no-bias fix applied)
+_use_aiter = _is_hip  # CK MXFP4 fused_moe enabled
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 if _is_hip:
