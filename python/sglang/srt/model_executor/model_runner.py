@@ -2845,7 +2845,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        try:
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        except Exception as e:
+            logger.warning(
+                f"Failed to capture piecewise CUDA graphs: {e}. "
+                "EXTEND batches will use non-graph path."
+            )
+            self.piecewise_cuda_graph_runner = None
+            return
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
