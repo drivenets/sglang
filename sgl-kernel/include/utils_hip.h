@@ -375,6 +375,10 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else  // USE_ROCM
+// gfx942 and gfx950 use FNUZ FP8 format
+#if !defined(HIP_FP8_TYPE_FNUZ) && !defined(HIP_FP8_TYPE_E4M3)
+#define HIP_FP8_TYPE_FNUZ 1
+#endif
 #if HIP_FP8_TYPE_FNUZ
 #include <c10/util/Float8_e4m3fnuz.h>
 using FP8_TYPE = c10::Float8_e4m3fnuz;
@@ -385,7 +389,10 @@ constexpr auto FP8_E4M3_MAX = 224.0f;
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else
-#error "fp8 is not supported in this processor (arch < gfx942)."
+// Fallback: default to FNUZ for any ROCm GPU
+#include <c10/util/Float8_e4m3fnuz.h>
+using FP8_TYPE = c10::Float8_e4m3fnuz;
+constexpr auto FP8_E4M3_MAX = 224.0f;
 #endif  // HIP_FP8_TYPE_E4M3
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM

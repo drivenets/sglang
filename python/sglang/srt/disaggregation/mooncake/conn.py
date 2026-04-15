@@ -567,9 +567,24 @@ class MooncakeKVManager(CommonKVManager):
             )
         return ret
 
+    _transfer_call_count = 0
+    _transfer_total_blocks = 0
+    _transfer_total_bytes = 0
+
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
+
+        MooncakeKVManager._transfer_call_count += 1
+        MooncakeKVManager._transfer_total_blocks += len(transfer_blocks)
+        total_bytes = sum(b[2] for b in transfer_blocks)
+        MooncakeKVManager._transfer_total_bytes += total_bytes
+        c = MooncakeKVManager._transfer_call_count
+        if c <= 3 or c % 200 == 0:
+            avg_blocks = MooncakeKVManager._transfer_total_blocks / c
+            avg_bytes = MooncakeKVManager._transfer_total_bytes / c
+            logger.info(f"Transfer #{c}: {len(transfer_blocks)} blocks, {total_bytes/1024:.0f}KB, "
+                        f"avg_blocks={avg_blocks:.0f}, avg_bytes={avg_bytes/1024:.0f}KB")
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
         return self.engine.batch_transfer_sync(

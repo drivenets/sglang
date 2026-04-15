@@ -42,9 +42,18 @@ if _is_npu:
     from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
 
 if _is_hip:
-    from sglang.srt.layers.attention.utils import (
-        fused_qk_rope_reshape_and_cache,
+    from aiter.ops.triton.fusions.fused_kv_cache import (
+        fused_qk_rope_reshape_and_cache as _aiter_fused_rope,
     )
+    # Wrap aiter's API (separate cos/sin) to match sglang's API (combined cos_sin)
+    def fused_qk_rope_reshape_and_cache(q, k, **kwargs):
+        cos_sin = kwargs.pop('cos_sin')
+        rot_dim = cos_sin.shape[-1] // 2
+        kwargs['cos'] = cos_sin[..., :rot_dim]
+        kwargs['sin'] = cos_sin[..., rot_dim:]
+        # Remove swa_slot_mapping - not supported by aiter's kernel
+        kwargs.pop('swa_slot_mapping', None)
+        return _aiter_fused_rope(q, k, **kwargs)
 
 
 class RotaryEmbedding(MultiPlatformOp):

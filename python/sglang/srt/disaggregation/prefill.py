@@ -421,17 +421,28 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
+        import time as _time
+        _loop_count = 0
+        _loop_sums = {"recv": 0.0, "get_batch": 0.0, "run_batch": 0.0,
+                       "process_result": 0.0, "inflight": 0.0, "sample": 0.0, "total": 0.0}
+        self._pr_sums = {"sync": 0.0, "tolist": 0.0, "cache": 0.0, "send_kv": 0.0, "rest": 0.0, "count": 0}
+        _INTERVAL = 200
+
         while True:
+            _t0 = _time.perf_counter()
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            _t1 = _time.perf_counter()
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
+            _t2 = _time.perf_counter()
 
             # Launch the current batch
             if batch:
@@ -441,6 +452,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+            _t3 = _time.perf_counter()
 
             # Process the last batch
             if self.last_batch:
@@ -449,12 +461,39 @@ class SchedulerDisaggregationPrefillMixin:
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+            _t4 = _time.perf_counter()
 
             self.process_disagg_prefill_inflight_queue()
+            _t5 = _time.perf_counter()
 
             # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
+            _t6 = _time.perf_counter()
+
+            _loop_sums["recv"] += _t1 - _t0
+            _loop_sums["get_batch"] += _t2 - _t1
+            _loop_sums["run_batch"] += _t3 - _t2
+            _loop_sums["process_result"] += _t4 - _t3
+            _loop_sums["inflight"] += _t5 - _t4
+            _loop_sums["sample"] += _t6 - _t5
+            _loop_sums["total"] += _t6 - _t0
+            _loop_count += 1
+
+            if _loop_count % _INTERVAL == 0:
+                import logging
+                _logger = logging.getLogger(__name__)
+                _msg = (f"[SCHED_PROFILE] {_loop_count} iters: "
+                        + ", ".join(f"{k}={v/_INTERVAL*1000:.1f}ms" for k, v in _loop_sums.items()))
+                _logger.info(_msg)
+                if self._pr_sums["count"] > 0:
+                    _n = self._pr_sums["count"]
+                    _logger.info(f"[PR_DETAIL] {_n} reqs: "
+                        f"sync={self._pr_sums['sync']/_n*1000:.2f}ms, "
+                        f"tolist={self._pr_sums['tolist']/_n*1000:.2f}ms, "
+                        f"cache={self._pr_sums['cache']/_n*1000:.2f}ms, "
+                        f"send_kv={self._pr_sums['send_kv']/_n*1000:.2f}ms")
+                    self._pr_sums = {"sync": 0.0, "tolist": 0.0, "cache": 0.0, "send_kv": 0.0, "rest": 0.0, "count": 0}
+                _loop_sums = {k: 0.0 for k in _loop_sums}
 
             # Update last_batch
             self.last_batch = batch
@@ -482,12 +521,16 @@ class SchedulerDisaggregationPrefillMixin:
             result.copy_done,
         )
 
+        import time as _ptime
+        _ps0 = _ptime.perf_counter()
         if copy_done is not None:
             copy_done.synchronize()
+        _ps1 = _ptime.perf_counter()
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
+        _ps2 = _ptime.perf_counter()
         if batch.return_logprob:
             if logits_output.next_token_logprobs is not None:
                 logits_output.next_token_logprobs = (
@@ -506,7 +549,9 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
+                _pc0 = _ptime.perf_counter()
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                _pc1 = _ptime.perf_counter()
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
@@ -531,8 +576,16 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                _pk0 = _ptime.perf_counter()
                 self.send_kv_chunk(req, last_chunk=True)
+                _pk1 = _ptime.perf_counter()
                 req.time_stats.set_prefill_transfer_queue_entry_time()
+                # Accumulate sub-timings for this req
+                self._pr_sums["sync"] += _ps1 - _ps0
+                self._pr_sums["tolist"] += _ps2 - _ps1
+                self._pr_sums["cache"] += _pc1 - _pc0
+                self._pr_sums["send_kv"] += _pk1 - _pk0
+                self._pr_sums["count"] += 1
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.

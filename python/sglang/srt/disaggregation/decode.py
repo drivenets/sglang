@@ -128,7 +128,8 @@ class DecodeReqToTokenPool:
                 device=device,
             )
 
-        self.free_slots = list(range(size + pre_alloc_size))
+        # Reserve slot 0 as sentinel for CUDA graph padding
+        self.free_slots = list(range(1, size + pre_alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -165,7 +166,8 @@ class DecodeReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        # Reserve slot 0 as sentinel for CUDA graph padding
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size))
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -222,7 +224,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
-        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        # Reserve slot 0 as sentinel for CUDA graph padding
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size))
         self.mamba_pool.clear()
 
 
@@ -889,6 +892,9 @@ class DecodePreallocQueue:
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
+            # Sort free pages before decode pre-allocation to return contiguous indices.
+            # Contiguous pages reduce RDMA blocks from ~4500 to ~36 per request.
+            self.token_to_kv_pool_allocator.merge_and_sort_free()
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
@@ -977,7 +983,8 @@ class DecodeTransferQueue:
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
-        actual_room = output_bootstrap_room[0].item()
+        # Use int() on CPU tensor slice to avoid aten::item dispatcher overhead
+        actual_room = int(output_bootstrap_room[0])
         expected_room = (
             decode_req.req.bootstrap_room
             if decode_req.req.bootstrap_room is not None
@@ -1012,14 +1019,17 @@ class DecodeTransferQueue:
 
         # Case 3: Success - commit the transfer
         # Apply FP8 KV scales from prefill if present
-        if fp8_kv_scales is not None and fp8_kv_scales.abs().sum() > 0:
+        # Use .any() on CPU to avoid GPU sync from .abs().sum() > 0
+        if fp8_kv_scales is not None and not getattr(self, '_fp8_scales_applied', False):
             self._apply_fp8_kv_scales(fp8_kv_scales)
 
-        decode_req.req.output_ids.append(output_id[0].item())
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        # Batch-extract all scalar values at once to avoid per-field aten::item overhead
+        _cached = cached_tokens[:4].tolist()
+        decode_req.req.output_ids.append(int(output_id[0]))
+        decode_req.req.cached_tokens = _cached[0]
+        decode_req.req.cached_tokens_device = _cached[1]
+        decode_req.req.cached_tokens_host = _cached[2]
+        decode_req.req.cached_tokens_storage = _cached[3]
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -1027,10 +1037,10 @@ class DecodeTransferQueue:
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(
-                output_token_logprobs_val[0].item()
+                float(output_token_logprobs_val[0])
             )
             decode_req.req.output_token_logprobs_idx.append(
-                output_token_logprobs_idx[0].item()
+                int(output_token_logprobs_idx[0])
             )
             decode_req.req.output_top_logprobs_val.append(
                 output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
@@ -1202,16 +1212,27 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        import time as _time, logging as _logging
+        _dl = _logging.getLogger(__name__)
+        _batch_count = 0
+        _sums = {"recv": 0.0, "get_batch": 0.0, "run_batch": 0.0,
+                 "process_result": 0.0, "sample": 0.0, "total": 0.0}
+        _LOG_EVERY = 40
+
         while True:
+            _t0 = _time.perf_counter()
+
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+            _t1 = _time.perf_counter()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
+            _t2 = _time.perf_counter()
 
             # Launch the current batch
             if batch:
@@ -1219,6 +1240,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+            _t3 = _time.perf_counter()
 
             # Process the last batch
             if self.last_batch:
@@ -1226,10 +1248,25 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
+            _t4 = _time.perf_counter()
 
             # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             self.launch_batch_sample_if_needed(batch_result)
+            _t5 = _time.perf_counter()
+
+            if batch:
+                _sums["recv"] += _t1 - _t0
+                _sums["get_batch"] += _t2 - _t1
+                _sums["run_batch"] += _t3 - _t2
+                _sums["process_result"] += _t4 - _t3
+                _sums["sample"] += _t5 - _t4
+                _sums["total"] += _t5 - _t0
+                _batch_count += 1
+                if _batch_count % _LOG_EVERY == 0:
+                    _bs = batch.batch_size() if hasattr(batch, 'batch_size') else '?'
+                    _dl.info(f"[DECODE_PROFILE] {_batch_count} batches (bs={_bs}): "
+                        + ", ".join(f"{k}={v/_LOG_EVERY*1000:.1f}ms" for k, v in _sums.items()))
+                    _sums = {k: 0.0 for k in _sums}
 
             # Update last_batch
             self.last_batch = batch

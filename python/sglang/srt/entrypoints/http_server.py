@@ -1993,6 +1993,42 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return False
 
+    # Triton cache warmup: send requests at varying concurrency to exercise
+    # all batch-size-dependent Triton kernel specializations.  Each unique
+    # next_power_of_2(batch_size) triggers a one-time ~100ms Triton JIT
+    # compilation.  By exercising them here we move the cost out of the
+    # serving path.
+    if success and model_info["is_generation"]:
+        try:
+            logger.info("Triton cache warmup: exercising batch size specializations...")
+            import concurrent.futures
+
+            warmup_url = url + request_name
+            # Use a short prompt to minimize compute, just trigger the scheduler path
+            for conc in [1, 2, 4, 8, 16, 32]:
+                triton_json = dict(json_data)
+                triton_json["sampling_params"] = {"temperature": 0, "max_new_tokens": 1}
+                if "text" in triton_json:
+                    triton_json["text"] = "warmup " * 100
+
+                def _send(_i):
+                    try:
+                        return requests.post(
+                            warmup_url, json=triton_json, headers=headers,
+                            timeout=120, verify=ssl_verify,
+                        ).status_code
+                    except Exception:
+                        return -1
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=conc) as ex:
+                    codes = list(ex.map(_send, range(conc)))
+                ok = sum(1 for c in codes if c == 200)
+                logger.info(f"  concurrency {conc}: {ok}/{conc} OK")
+
+            logger.info("Triton cache warmup complete.")
+        except Exception as e:
+            logger.warning(f"Triton cache warmup failed (non-fatal): {e}")
+
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")
     return success

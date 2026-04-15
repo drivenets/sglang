@@ -82,7 +82,9 @@ if _is_hip:
                 static_per_tensor_quant,
             )
         except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+            # Older aiter versions may not export these directly;
+            # fall through to vllm/native fallback
+            _use_aiter = False
     else:
         try:
             import vllm._C  # noqa: F401

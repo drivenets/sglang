@@ -2137,13 +2137,162 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
+        Pre-compiles Triton kernels for all expected constexpr specializations
+        and runs FlashInfer autotune.
         """
         if self.device != "cuda":
             return
 
+        # NOTE: _triton_kernel_warmup() is available but disabled at startup
+        # because allocating GPU tensors during TP init causes SIGABRT on some
+        # ranks. Instead, the Triton cache is warmed during Phase 3 of the
+        # Docker build (warmup requests) and persisted in the image at
+        # ~/.triton/cache/. For cold starts, use --warmup-requests with the
+        # benchmark to pre-populate the cache.
+
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
+
+    def _triton_kernel_warmup(self):
+        """Pre-compile ALL Triton kernels for expected constexpr specializations.
+
+        Triton JIT-compiles a new binary for each unique set of constexpr
+        parameters.  The first call with a new specialization stalls the GPU
+        for ~100 ms.  By exercising every combination here (during startup),
+        we move the cost out of the serving path.
+
+        This covers: alloc_extend/decode, write_req_to_token_pool, create_kv_indices,
+        compute_position, and set_mla_kv_buffer kernels.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info("Triton kernel warmup: pre-compiling specializations...")
+
+        page_size = self.server_args.page_size
+        max_context_len = self.server_args.context_length
+        max_bs = min(
+            v for v in [
+                self.server_args.max_running_requests,
+                self.server_args.cuda_graph_max_bs,
+                4096,
+            ] if v is not None
+        )
+
+        from sglang.srt.utils.common import next_power_of_2
+
+        device = self.device
+        compiled_count = 0
+
+        # --- 1. Alloc kernels (constexpr: bs_upper, page_size) ---
+        try:
+            from sglang.srt.mem_cache.allocator import (
+                alloc_extend_kernel,
+                alloc_decode_kernel,
+            )
+
+            bs_values = set()
+            bs = 1
+            while bs <= max_bs:
+                bs_values.add(bs)
+                bs *= 2
+
+            for bs_upper in sorted(bs_values):
+                try:
+                    dummy = torch.zeros(bs_upper, device=device, dtype=torch.int32)
+                    dummy_out = torch.zeros(
+                        max(bs_upper * page_size, 1), device=device, dtype=torch.int64
+                    )
+                    dummy_pages = torch.arange(
+                        bs_upper * 2, device=device, dtype=torch.int64
+                    )
+                    alloc_extend_kernel[(1,)](
+                        dummy, dummy, dummy, dummy_pages, dummy_out,
+                        bs_upper, page_size,
+                    )
+                    alloc_decode_kernel[(1,)](
+                        dummy, dummy, dummy_pages, dummy_out,
+                        bs_upper, page_size,
+                    )
+                    compiled_count += 2
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
+        # --- 2. write_req_to_token_pool (constexpr: req_to_token_ptr_stride) ---
+        try:
+            from sglang.srt.mem_cache.common import write_req_to_token_pool_triton
+
+            dummy_pool = torch.zeros(
+                (2, max_context_len), device=device, dtype=torch.int32
+            )
+            dummy_idx = torch.zeros(1, device=device, dtype=torch.int64)
+            dummy_prefix = torch.zeros(1, device=device, dtype=torch.int64)
+            dummy_lens = torch.ones(1, device=device, dtype=torch.int32)
+            dummy_out = torch.zeros(page_size, device=device, dtype=torch.int64)
+            write_req_to_token_pool_triton[(1,)](
+                dummy_pool,
+                dummy_idx,
+                dummy_prefix,
+                dummy_lens,
+                dummy_lens,
+                dummy_lens,
+                dummy_out,
+                max_context_len,
+            )
+            compiled_count += 1
+        except Exception:
+            pass
+
+        # --- 3. create_flashinfer_kv_indices (constexpr: req_to_token_ptr_stride) ---
+        try:
+            from sglang.srt.layers.attention.utils import (
+                create_flashinfer_kv_indices_triton,
+            )
+
+            dummy_pool = torch.zeros(
+                (2, max_context_len), device=device, dtype=torch.int32
+            )
+            dummy_idx = torch.zeros(1, device=device, dtype=torch.int64)
+            dummy_lens = torch.ones(1, device=device, dtype=torch.int32)
+            dummy_indptr = torch.tensor([0, 1], device=device, dtype=torch.int32)
+            dummy_kv = torch.zeros(1, device=device, dtype=torch.int32)
+            dummy_start = torch.zeros(1, device=device, dtype=torch.int32)
+            create_flashinfer_kv_indices_triton[(1,)](
+                dummy_pool,
+                dummy_idx,
+                dummy_lens,
+                dummy_indptr,
+                dummy_start,
+                dummy_kv,
+                max_context_len,
+            )
+            compiled_count += 1
+        except Exception:
+            pass
+
+        # --- 4. compute_position_kernel (constexpr: has_prefix) ---
+        try:
+            from sglang.srt.model_executor.forward_batch_info import (
+                compute_position_kernel,
+            )
+
+            dummy_pos = torch.zeros(page_size, device=device, dtype=torch.int64)
+            dummy_start = torch.zeros(1, device=device, dtype=torch.int64)
+            dummy_lens = torch.ones(1, device=device, dtype=torch.int32)
+            for has_prefix in [True, False]:
+                compute_position_kernel[(1,)](
+                    dummy_pos, dummy_start, dummy_lens, dummy_lens, has_prefix,
+                )
+                compiled_count += 1
+        except Exception:
+            pass
+
+        torch.cuda.synchronize()
+        logger.info(
+            f"Triton kernel warmup: pre-compiled {compiled_count} specializations"
+        )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

@@ -340,7 +340,7 @@ void transfer_kv_launcher(
         src_v_tbl_ptr,
         dst_v_tbl_ptr);
   }
-  C10_HIP_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void transfer_kv_per_layer(

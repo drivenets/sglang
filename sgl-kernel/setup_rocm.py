@@ -43,18 +43,18 @@ include_dirs = [
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/allreduce/deterministic_all_reduce.hip",
-    "csrc/allreduce/quick_all_reduce.cu",
+    "csrc/allreduce/quick_all_reduce.hip",
     "csrc/common_extension_rocm.cc",
-    "csrc/elementwise/activation.cu",
-    "csrc/elementwise/topk.cu",
-    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
-    "csrc/moe/moe_align_kernel.cu",
-    "csrc/moe/moe_topk_softmax_kernels.cu",
-    "csrc/moe/moe_topk_sigmoid_kernels.cu",
-    "csrc/speculative/eagle_utils.cu",
-    "csrc/kvcacheio/transfer.cu",
+    "csrc/elementwise/activation.hip",
+    "csrc/elementwise/topk.hip",
+    "csrc/grammar/apply_token_bitmask_inplace_hip.hip",
+    "csrc/moe/moe_align_kernel.hip",
+    "csrc/moe/moe_topk_softmax_kernels.hip",
+    "csrc/moe/moe_topk_sigmoid_kernels.hip",
+    "csrc/speculative/eagle_utils.hip",
+    "csrc/kvcacheio/transfer.hip",
     "csrc/memory/weak_ref_tensor.cpp",
-    "csrc/elementwise/pos_enc.cu",
+    "csrc/elementwise/pos_enc.hip",
 ]
 
 cxx_flags = ["-O3"]
@@ -79,7 +79,7 @@ if amdgpu_target not in ["gfx942", "gfx950"]:
     sys.exit(1)
 
 fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
+    "-DHIP_FP8_TYPE_FNUZ=1" if amdgpu_target in ("gfx942", "gfx950") else "-DHIP_FP8_TYPE_E4M3=1"
 )
 
 # Dynamic shared-memory budget for the TopK kernels.

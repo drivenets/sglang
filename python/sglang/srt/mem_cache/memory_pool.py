@@ -144,7 +144,10 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(size))
+        # Reserve slot 0 as a sentinel for CUDA graph padding.
+        # Padded entries in req_pool_indices point here during graph replay,
+        # preventing writes to slots allocated to real requests.
+        self.free_slots = list(range(1, size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -184,7 +187,8 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size))
+        # Reserve slot 0 as sentinel for CUDA graph padding (same as __init__)
+        self.free_slots = list(range(1, self.size))
 
 
 class MambaPool:

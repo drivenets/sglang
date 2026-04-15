@@ -304,9 +304,10 @@ def create_fused_set_kv_buffer_arg(
         )
     else:
         page_size = token_to_kv_pool.page_size
+        _swa_mapping = getattr(token_to_kv_pool, 'full_to_swa_index_mapping', None)
         slot_mapping_swa = (
-            token_to_kv_pool.full_to_swa_index_mapping.long()
-            if layer.sliding_window_size > 0
+            _swa_mapping.long()
+            if layer.sliding_window_size > 0 and _swa_mapping is not None
             else None
         )
         return {

@@ -268,9 +268,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
-            # Reset padded req_pool_indices to prevent stale pointers to freed
-            # KV cache pages from causing illegal memory access during replay.
-            # Use index 0 (always valid) for padded entries.
+            # CUDA graph padding fix: Use reserved slot 0 for padded entries.
+            # Slot 0 in ReqToTokenPool is reserved (never allocated to real
+            # requests), and slot 0 in the token KV pool is also reserved.
+            # This ensures padded entries read/write only to sentinel slots,
+            # preventing corruption of real requests' KV cache.
             self.req_pool_indices[raw_bs:bs].zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
