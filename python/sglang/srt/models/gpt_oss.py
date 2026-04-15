@@ -106,6 +106,7 @@ if _is_tinygemm_supported:
 else:
     tinygemm_bf16 = None
 
+from sglang.srt.compilation.piecewise_context_manager import is_piecewise_capture_active
 from sglang.srt.utils import get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -411,7 +412,13 @@ class GptOssAttention(nn.Module):
             # Don't apply RoPE here -- the backend will do it fused with KV cache write
         else:
             extra_args = {}
-            if not _is_npu:
+            if not _is_npu:  # sgl_kernel not available on HIP
+                # Skip the fused RoPE+KV-cache kernel during piecewise
+                # CUDA graph capture — torch.compile cannot trace it.
+                _can_fuse = (
+                    enable_fused_set_kv_buffer(forward_batch)
+                    and not is_piecewise_capture_active()
+                )
                 extra_args = {
                     "fused_set_kv_buffer_arg": (
                         create_fused_set_kv_buffer_arg(
@@ -419,7 +426,7 @@ class GptOssAttention(nn.Module):
                             layer=self.attn,
                             forward_batch=forward_batch,
                         )
-                        if enable_fused_set_kv_buffer(forward_batch)
+                        if _can_fuse
                         else None
                     ),
                 }
@@ -437,6 +444,13 @@ class GptOssAttention(nn.Module):
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
+        # Flash attention may return (tokens, heads, head_dim) instead of
+        # (tokens, heads * head_dim) during piecewise CUDA graph warmup.
+        # Flatten to 2-D with the correct feature dimension for o_proj.
+        if attn_output.ndim == 3:
+            attn_output = attn_output.reshape(attn_output.shape[0], -1)
+        elif attn_output.shape[-1] != self.q_size:
+            attn_output = attn_output.reshape(-1, self.q_size)
         output, _ = self.o_proj(attn_output)
         return output
 

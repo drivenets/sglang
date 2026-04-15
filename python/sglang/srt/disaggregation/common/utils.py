@@ -24,6 +24,19 @@ class FastQueue:
                 self._cond.wait()
             return self._buf.popleft()
 
+    def drain(self, max_items: int) -> list:
+        """Get up to max_items from the queue without blocking.
+
+        Returns at least 1 item (blocks for the first) and up to max_items.
+        """
+        with self._cond:
+            while not self._buf:
+                self._cond.wait()
+            items = []
+            while self._buf and len(items) < max_items:
+                items.append(self._buf.popleft())
+            return items
+
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]

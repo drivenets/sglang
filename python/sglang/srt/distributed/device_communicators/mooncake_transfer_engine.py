@@ -251,6 +251,40 @@ class MooncakeTransferEngine:
             )
         return ret
 
+    def batch_transfer_async(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Submit an asynchronous batch transfer.
+
+        Returns a batch_id (>0) on successful submission, 0 on failure.
+        Use get_batch_transfer_status() to poll for completion.
+        """
+        try:
+            batch_id = self.engine.batch_transfer_async_write(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
+        except Exception:
+            batch_id = 0
+        if batch_id == 0:
+            logger.debug(
+                "Failed to submit async batch transfer. Session: %s, "
+                "num_blocks: %d",
+                session_id,
+                len(buffers),
+            )
+        return batch_id
+
+    def get_batch_transfer_status(self, batch_ids: List[int]) -> int:
+        """Wait for async batch transfers to complete.
+
+        Returns 0 on success, non-zero on failure.
+        """
+        return self.engine.get_batch_transfer_status(batch_ids)
+
     def get_session_id(self):
         return self.session_id
 
