@@ -1211,13 +1211,41 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         staging_buffer=None,
     ):
+        """Transfer worker with optional coalescing and async RDMA.
+
+        Env vars:
+            SGLANG_PD_COALESCE_SIZE (int, default 1):
+                max number of chunks to drain per loop iteration and coalesce
+                into a single batch_transfer per session. 1 = disabled
+                (one chunk at a time, matches baseline behaviour).
+            SGLANG_PD_ASYNC_TRANSFERS (int, default 0):
+                when 1 and coalescing is active, use batch_transfer_async +
+                get_batch_transfer_status so multiple destination sessions
+                can be in flight concurrently. 0 = use batch_transfer_sync.
+
+        Correct ordering (critical for correctness):
+            Phase 1: collect per-chunk work, build RDMA blocks for coalesced
+                     sessions (no transfers yet).
+            Phase 2: issue the KV transfers (coalesced: one call per session).
+            Phase 3: send hisparse/staging/slice (still per-chunk), then aux
+                     data, then update_status and notify decode.
+        """
         staging_strategy = None
-        _MAX_COALESCE = 8  # Max chunks to batch into one RDMA call
+        coalesce_size = max(1, int(os.environ.get("SGLANG_PD_COALESCE_SIZE", "1")))
+        use_async = bool(int(os.environ.get("SGLANG_PD_ASYNC_TRANSFERS", "0")))
+        if coalesce_size > 1:
+            logger.info(
+                f"Transfer worker: coalesce_size={coalesce_size}, "
+                f"async={'on' if use_async else 'off'}"
+            )
 
         while True:
             try:
-                # --- Drain up to _MAX_COALESCE chunks from the queue ---
-                chunks = queue.drain(_MAX_COALESCE)
+                # --- Drain up to coalesce_size chunks from the queue ---
+                if coalesce_size > 1:
+                    chunks = queue.drain(coalesce_size)
+                else:
+                    chunks = [queue.get()]
 
                 if (
                     self.enable_staging
@@ -1232,153 +1260,224 @@ class MooncakeKVManager(CommonKVManager):
                     + self.attn_cp_rank
                 )
 
-                # Accumulate RDMA blocks across chunks for coalesced send.
-                # Key = mooncake_session_id, Value = list of (src, dst, len).
+                # --- Phase 1: validate chunks, compute coalesced KV blocks ---
+                # chunk_plan[i] = (kv_chunk, [(req, reg_info, chunked_dst, path), ...])
+                # path in {"coalesced", "hisparse", "staging", "slice",
+                #          "dummy", "failed_session", "skip"}
+                chunk_plans = []
+                # Key = mooncake_session_id, value = list of (src, dst, len).
                 coalesced_blocks: dict = {}
-                # Track which chunks used the coalesced path so we can
-                # attribute errors back to them.
-                coalesced_chunk_sessions: list = []
 
                 for kv_chunk in chunks:
                     reqs_to_be_processed = (
-                        self.transfer_infos[kv_chunk.room].values()
+                        list(self.transfer_infos[kv_chunk.room].values())
                         if kv_chunk.room in self.transfer_infos
                         else []
                     )
-                    polls = []
-                    dst_ranks_infos = []
-                    staging_deferred = False
+                    req_plan = []
                     for req in reqs_to_be_processed:
-                        if not req.is_dummy:
-                            with self.session_lock:
-                                if req.mooncake_session_id in self.failed_sessions:
-                                    self.record_failure(
-                                        kv_chunk.room,
-                                        f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
-                                    )
-                                    self.update_status(kv_chunk.room, KVPoll.Failed)
-                                    self.sync_status_to_decode_endpoint(
-                                        req.endpoint, req.dst_port, req.room,
-                                        KVPoll.Failed, prefill_unique_rank,
-                                    )
-                                    break
+                        if req.is_dummy:
+                            req_plan.append((req, None, None, "dummy"))
+                            continue
 
-                            chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                            if len(chunked_dst_kv_indice) < len(kv_chunk.prefill_kv_indices):
-                                logger.warning(
-                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, "
-                                    f"len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                                )
-                                kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                    : len(chunked_dst_kv_indice)
-                                ]
-
-                            target_rank_registration_info: KVArgsRegisterInfo = (
-                                self.decode_kv_args_table[req.mooncake_session_id]
+                        with self.session_lock:
+                            session_failed = (
+                                req.mooncake_session_id in self.failed_sessions
                             )
-                            if self.is_mla_backend or (
-                                self.attn_tp_size
-                                == target_rank_registration_info.dst_attn_tp_size
-                            ):
-                                if target_rank_registration_info.enable_hisparse:
-                                    ret = self.send_kvcache_hisparse(
-                                        req.mooncake_session_id,
-                                        kv_chunk.prefill_kv_indices,
-                                        target_rank_registration_info.dst_kv_ptrs,
-                                        req.dst_kv_indices,
-                                        kv_chunk.index_slice,
-                                        executor,
-                                    )
-                                else:
-                                    # Coalesce: accumulate blocks instead of sending
-                                    blocks = self.build_kvcache_blocks(
-                                        kv_chunk.prefill_kv_indices,
-                                        target_rank_registration_info.dst_kv_ptrs,
-                                        chunked_dst_kv_indice,
-                                    )
-                                    sid = req.mooncake_session_id
-                                    if sid not in coalesced_blocks:
-                                        coalesced_blocks[sid] = []
-                                    coalesced_blocks[sid].extend(blocks)
-                                    coalesced_chunk_sessions.append((kv_chunk, req))
-                                    ret = 0  # Deferred — checked after batch send
-                            elif (
-                                self.enable_staging
-                                and staging_strategy is not None
-                                and target_rank_registration_info.staging is not None
-                            ):
-                                ret, deferred = self._do_staging_transfer(
-                                    staging_strategy,
-                                    kv_chunk,
-                                    req,
-                                    target_rank_registration_info,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                    queue,
-                                    prefill_unique_rank,
-                                )
-                                if deferred:
-                                    staging_deferred = True
-                                    break
-                            else:
-                                ret = self.send_kvcache_slice(
-                                    req.mooncake_session_id,
+                        if session_failed:
+                            req_plan.append((req, None, None, "failed_session"))
+                            continue
+
+                        chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
+                        if len(chunked_dst_kv_indice) < len(kv_chunk.prefill_kv_indices):
+                            logger.warning(
+                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, "
+                                f"len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
+                            )
+                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
+                                : len(chunked_dst_kv_indice)
+                            ]
+
+                        target_rank_registration_info: KVArgsRegisterInfo = (
+                            self.decode_kv_args_table[req.mooncake_session_id]
+                        )
+
+                        if self.is_mla_backend or (
+                            self.attn_tp_size
+                            == target_rank_registration_info.dst_attn_tp_size
+                        ):
+                            if target_rank_registration_info.enable_hisparse:
+                                path = "hisparse"
+                            elif coalesce_size > 1:
+                                # Build blocks and accumulate for coalesced send.
+                                blocks = self.build_kvcache_blocks(
                                     kv_chunk.prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
-                                    target_rank_registration_info.dst_tp_rank,
-                                    target_rank_registration_info.dst_attn_tp_size,
-                                    target_rank_registration_info.dst_kv_item_len,
-                                    executor,
                                 )
-                            if ret != 0:
-                                with self.session_lock:
-                                    self.session_failures[req.mooncake_session_id] += 1
-                                    if self.session_failures[req.mooncake_session_id] >= 1:
-                                        self.failed_sessions.add(req.mooncake_session_id)
-                                        logger.error(f"Session {req.mooncake_session_id} failed.")
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Failed to send kv chunk of {kv_chunk.room} to "
-                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
-                                )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint, req.dst_port, req.room,
-                                    KVPoll.Failed, prefill_unique_rank,
-                                )
-                                break
-
-                            if kv_chunk.is_last_chunk:
-                                if kv_chunk.state_indices is not None:
-                                    self.maybe_send_extra(
-                                        req,
-                                        kv_chunk.state_indices,
-                                        target_rank_registration_info.dst_state_data_ptrs,
-                                        executor,
-                                        target_rank_registration_info,
-                                    )
-                                ret = self.send_aux(
-                                    req,
-                                    kv_chunk.prefill_aux_index,
-                                    target_rank_registration_info.dst_aux_ptrs,
-                                )
-                                polls.append(True if ret == 0 else False)
-                                dst_ranks_infos.append(
-                                    (req.endpoint, req.dst_port, req.room)
-                                )
-                                if len(polls) == req.required_dst_info_num:
-                                    status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                    self.update_status(req.room, status)
-                                    for endpoint, dst_port, room in dst_ranks_infos:
-                                        self.sync_status_to_decode_endpoint(
-                                            endpoint, dst_port, room,
-                                            status, prefill_unique_rank,
-                                        )
+                                sid = req.mooncake_session_id
+                                coalesced_blocks.setdefault(sid, []).extend(blocks)
+                                path = "coalesced"
+                            else:
+                                path = "standard"
+                        elif (
+                            self.enable_staging
+                            and staging_strategy is not None
+                            and target_rank_registration_info.staging is not None
+                        ):
+                            path = "staging"
                         else:
+                            path = "slice"
+
+                        req_plan.append(
+                            (req, target_rank_registration_info, chunked_dst_kv_indice, path)
+                        )
+                    chunk_plans.append((kv_chunk, req_plan))
+
+                # --- Phase 2: issue coalesced KV transfers (before aux/status) ---
+                # session_results[sid] = 0 on success, nonzero on failure.
+                session_results: dict = {}
+                if coalesced_blocks:
+                    if use_async:
+                        # Submit all, then poll for completion.
+                        pending: list = []
+                        for sid, blocks in coalesced_blocks.items():
+                            if not blocks:
+                                continue
+                            batch_id = self._transfer_data_async(sid, blocks)
+                            pending.append((sid, batch_id))
+                        for sid, batch_id in pending:
+                            if batch_id <= 0:
+                                session_results[sid] = -1
+                            else:
+                                session_results[sid] = (
+                                    self.engine.get_batch_transfer_status([batch_id])
+                                )
+                    else:
+                        for sid, blocks in coalesced_blocks.items():
+                            if not blocks:
+                                continue
+                            session_results[sid] = self._transfer_data(sid, blocks)
+
+                # --- Phase 3: per-chunk aux/status; also run non-coalesced paths ---
+                for kv_chunk, req_plan in chunk_plans:
+                    polls = []
+                    dst_ranks_infos = []
+                    staging_deferred = False
+
+                    for (req, reg_info, chunked_dst_kv_indice, path) in req_plan:
+                        if path == "dummy":
                             if kv_chunk.is_last_chunk and req.room in self.request_status:
                                 self.update_status(req.room, KVPoll.Success)
+                            continue
+
+                        if path == "failed_session":
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint, req.dst_port, req.room,
+                                KVPoll.Failed, prefill_unique_rank,
+                            )
+                            break
+
+                        if path == "coalesced":
+                            ret = session_results.get(req.mooncake_session_id, -1)
+                        elif path == "hisparse":
+                            ret = self.send_kvcache_hisparse(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                reg_info.dst_kv_ptrs,
+                                req.dst_kv_indices,
+                                kv_chunk.index_slice,
+                                executor,
+                            )
+                        elif path == "standard":
+                            ret = self.send_kvcache(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                reg_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                executor,
+                            )
+                        elif path == "staging":
+                            ret, deferred = self._do_staging_transfer(
+                                staging_strategy,
+                                kv_chunk,
+                                req,
+                                reg_info,
+                                chunked_dst_kv_indice,
+                                executor,
+                                queue,
+                                prefill_unique_rank,
+                            )
+                            if deferred:
+                                staging_deferred = True
+                                break
+                        elif path == "slice":
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                reg_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                reg_info.dst_tp_rank,
+                                reg_info.dst_attn_tp_size,
+                                reg_info.dst_kv_item_len,
+                                executor,
+                            )
+                        else:
+                            ret = -1
+
+                        if ret != 0:
+                            with self.session_lock:
+                                self.session_failures[req.mooncake_session_id] += 1
+                                if self.session_failures[req.mooncake_session_id] >= 1:
+                                    self.failed_sessions.add(req.mooncake_session_id)
+                                    logger.error(
+                                        f"Session {req.mooncake_session_id} failed."
+                                    )
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"Failed to send kv chunk of {kv_chunk.room} to "
+                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint, req.dst_port, req.room,
+                                KVPoll.Failed, prefill_unique_rank,
+                            )
+                            break
+
+                        if kv_chunk.is_last_chunk:
+                            if kv_chunk.state_indices is not None:
+                                self.maybe_send_extra(
+                                    req,
+                                    kv_chunk.state_indices,
+                                    reg_info.dst_state_data_ptrs,
+                                    executor,
+                                    reg_info,
+                                )
+                            ret = self.send_aux(
+                                req,
+                                kv_chunk.prefill_aux_index,
+                                reg_info.dst_aux_ptrs,
+                            )
+                            polls.append(True if ret == 0 else False)
+                            dst_ranks_infos.append(
+                                (req.endpoint, req.dst_port, req.room)
+                            )
+                            if len(polls) == req.required_dst_info_num:
+                                status = (
+                                    KVPoll.Success if all(polls) else KVPoll.Failed
+                                )
+                                self.update_status(req.room, status)
+                                for endpoint, dst_port, room in dst_ranks_infos:
+                                    self.sync_status_to_decode_endpoint(
+                                        endpoint, dst_port, room,
+                                        status, prefill_unique_rank,
+                                    )
 
                     if staging_deferred:
                         continue
@@ -1390,49 +1489,11 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.room in self.transfer_infos:
                             self.transfer_infos.pop(kv_chunk.room)
 
-                # --- Coalesced async batch send ---
-                # Submit all accumulated blocks as async transfers, then
-                # poll for completion.  This overlaps RDMA for multiple
-                # sessions and avoids the per-session sync stall.
-                pending_batches = []  # (session_id, batch_id)
-                for sid, blocks in coalesced_blocks.items():
-                    if blocks:
-                        batch_id = self._transfer_data_async(sid, blocks)
-                        if batch_id == 0:
-                            # Submission failed — mark as error
-                            pending_batches.append((sid, 0))
-                        elif batch_id > 0:
-                            pending_batches.append((sid, batch_id))
-                        # batch_id == -1 means empty blocks, skip
-
-                # Wait for all async transfers to complete
-                for sid, batch_id in pending_batches:
-                    if batch_id == 0:
-                        ret = -1  # Submission failed
-                    else:
-                        ret = self.engine.get_batch_transfer_status([batch_id])
-                    if ret != 0:
-                        with self.session_lock:
-                            self.session_failures[sid] += 1
-                            self.failed_sessions.add(sid)
-                            logger.error(f"Coalesced async transfer for session {sid} failed.")
-                        for ck, cr in coalesced_chunk_sessions:
-                            if cr.mooncake_session_id == sid:
-                                self.record_failure(
-                                    ck.room,
-                                    f"Coalesced transfer failed for {ck.room}",
-                                )
-                                self.update_status(ck.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    cr.endpoint, cr.dst_port, cr.room,
-                                    KVPoll.Failed, prefill_unique_rank,
-                                )
-
-                if len(chunks) > 1 and coalesced_blocks:
+                if coalesce_size > 1 and len(chunks) > 1 and coalesced_blocks:
                     total_blocks = sum(len(b) for b in coalesced_blocks.values())
                     logger.debug(
                         f"Coalesced {len(chunks)} chunks into {len(coalesced_blocks)} "
-                        f"batch_transfer_sync calls ({total_blocks} blocks total)"
+                        f"transfers ({total_blocks} blocks total)"
                     )
 
             except Exception as e:
@@ -1680,9 +1741,20 @@ class MooncakeKVManager(CommonKVManager):
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        #
+        # BUG: with a single decode destination (1P1D, or any config where all
+        # sessions share the same port), session_port_sum is constant across
+        # all requests, so every request hashes to the same queue and the
+        # other transfer_queue_size-1 workers sit idle.  At c=256 this
+        # serialised ~256 transfers through one worker, burning ~1.4s of
+        # transfer_duration per request.  Opt-in round-robin by bootstrap_room
+        # via SGLANG_PD_SHARD_BY_ROOM=1 spreads transfers evenly.
+        if int(os.environ.get("SGLANG_PD_SHARD_BY_ROOM", "0")):
+            shard_idx = bootstrap_room % len(self.transfer_queues)
+        else:
+            dst_infos = self.transfer_infos[bootstrap_room].keys()
+            session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+            shard_idx = session_port_sum % len(self.transfer_queues)
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(

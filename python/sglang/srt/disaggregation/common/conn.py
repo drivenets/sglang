@@ -44,6 +44,29 @@ from sglang.srt.utils.network import (
 logger = logging.getLogger(__name__)
 
 
+class _LockedPushSocket:
+    """Thin proxy around a ZMQ PUSH socket that serialises send_multipart.
+
+    ZMQ sockets are not thread-safe for concurrent send_multipart calls; parts
+    from different messages can interleave on the wire, producing malformed
+    multi-frame messages on the receiver (e.g. "too many values to unpack").
+    Callers used to avoid this accidentally because the whole transfer path
+    ran on a single worker thread — but that constraint goes away as soon as
+    multiple transfer_workers sync status concurrently.
+    """
+
+    def __init__(self, socket):
+        self._socket = socket
+        self._lock = threading.Lock()
+
+    def send_multipart(self, parts, *args, **kwargs):
+        with self._lock:
+            return self._socket.send_multipart(parts, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._socket, name)
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -369,11 +392,18 @@ class CommonKVManager(BaseKVManager):
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
-        socket = zmq.Context().socket(zmq.PUSH)
+        # BUG: ZMQ PUSH sockets are NOT thread-safe for concurrent
+        # send_multipart.  Because @cache returns the same socket across
+        # threads, concurrent senders used to interleave multi-frame
+        # messages (seen as "too many values to unpack" on the receiver).
+        # Wrap the socket in a lock-guarded proxy so send_multipart is
+        # serialised per-endpoint while allowing parallelism across
+        # different endpoints.
+        raw = zmq.Context().socket(zmq.PUSH)
         if is_ipv6:
-            socket.setsockopt(zmq.IPV6, 1)
-        socket.connect(endpoint)
-        return socket
+            raw.setsockopt(zmq.IPV6, 1)
+        raw.connect(endpoint)
+        return _LockedPushSocket(raw)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
