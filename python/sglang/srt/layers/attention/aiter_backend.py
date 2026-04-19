@@ -2618,6 +2618,12 @@ class AiterAttnBackend(AttentionBackend):
                     k_cache = k_cache.to(self.input_dtype)
                     v_cache = v_cache.to(self.input_dtype)
 
+                # dbe2a9d39: pass learned attention sinks (GPT-OSS) to the
+                # decode kernel. Without this, GPT-OSS produces garbage.
+                sink_ptr = None
+                if sinks is not None:
+                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
+
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     self.workspace_buffer,
@@ -2638,6 +2644,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.v_scale,
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
+                    sink_ptr=sink_ptr,
                 )
 
         return o
