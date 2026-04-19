@@ -1137,6 +1137,7 @@ class SchedulerOutputProcessorMixin:
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,
                     prompt_tokens=prompt_tokens,
+                    reasoning_tokens=None,  # compat: upstream-added, dnai-extras predates it
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
