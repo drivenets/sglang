@@ -189,6 +189,11 @@ class ModelConfig:
             is_multimodal_model(self.hf_config.architectures)
             or has_multimodal_subconfig
         )
+        # Compat stub for dnai-extras code that references is_multimodal_gen.
+        # Newer upstream split is_multimodal into is_multimodal_gen (generation
+        # models) vs is_multimodal (understanding). amd-baseline predates that
+        # split. Default False — GPT-OSS is text-only.
+        self.is_multimodal_gen = False
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
