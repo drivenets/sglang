@@ -128,7 +128,8 @@ class DecodeReqToTokenPool:
                 device=device,
             )
 
-        self.free_slots = list(range(size + pre_alloc_size))
+        # Reserve slot 0 as sentinel for CUDA graph padding
+        self.free_slots = list(range(1, size + pre_alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -165,7 +166,8 @@ class DecodeReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        # Reserve slot 0 as sentinel for CUDA graph padding
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size))
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -222,7 +224,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
-        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        # Reserve slot 0 as sentinel for CUDA graph padding
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size))
         self.mamba_pool.clear()
 
 
@@ -883,6 +886,9 @@ class DecodePreallocQueue:
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
+            # Sort free pages before decode pre-allocation to return contiguous indices.
+            # Contiguous pages reduce RDMA blocks from ~4500 to ~36 per request.
+            self.token_to_kv_pool_allocator.merge_and_sort_free()
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device

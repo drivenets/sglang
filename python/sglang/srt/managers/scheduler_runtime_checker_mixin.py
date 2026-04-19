@@ -256,7 +256,9 @@ class SchedulerRuntimeCheckerMixin:
             req_total_size = self.req_to_token_pool.size
 
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
+        # Account for reserved sentinel slot 0 (used for CUDA graph padding)
+        reserved_slots = 1
+        if len(self.req_to_token_pool.free_slots) + session_req_count + reserved_slots != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "

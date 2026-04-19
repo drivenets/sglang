@@ -268,6 +268,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            # CUDA graph padding fix: Use reserved slot 0 for padded entries.
+            # Slot 0 in ReqToTokenPool / DecodeReqToTokenPool is reserved
+            # (never allocated to real requests), so padded entries read/write
+            # only to sentinel slots — no corruption of real requests' KV.
+            self.req_pool_indices[raw_bs:bs].zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
