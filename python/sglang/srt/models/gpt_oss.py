@@ -87,7 +87,9 @@ import torch.distributed as dist
 from sglang.srt.utils import get_bool_env_var
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_use_fused_rope_cache = _use_aiter  # Fused RoPE + KV cache write
+_use_fused_rope_cache = _use_aiter and not get_bool_env_var(
+    "SGLANG_DISABLE_FUSED_ROPE_CACHE"
+)  # Fused RoPE + KV cache write
 
 if _use_fused_rope_cache:
     try:
