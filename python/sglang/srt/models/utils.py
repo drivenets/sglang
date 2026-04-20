@@ -272,13 +272,22 @@ class AutoWeightsLoader:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    # The HIP branch must also exclude SWAKVPool: on ROCm the fused
+    # rotary_emb(fused_set_kv_buffer_arg=...) path does not write the SWA
+    # slice of a SWAKVPool, and the caller skips the plain set_kv_buffer
+    # write when this returns True. Allowing it for SWA layers would leave
+    # the KV cache empty and garble all post-first decode tokens.
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
-    ) or (_is_hip and not is_prefill_context_parallel_enabled())
+    ) or (
+        _is_hip
+        and not is_prefill_context_parallel_enabled()
+        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+    )
 
 
 def create_fused_set_kv_buffer_arg(
