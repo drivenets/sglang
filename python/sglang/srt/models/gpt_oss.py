@@ -565,6 +565,7 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        _timing = False  # SGLANG_TIME_LAYER0 instrumentation disabled (needs _ensure_timer_events scaffolding)
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
