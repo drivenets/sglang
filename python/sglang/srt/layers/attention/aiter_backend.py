@@ -230,6 +230,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         # Track which layers have been calibrated (first-extend scale computation)
         self._fp8_scales_calibrated = [False] * num_layers
+        # Host-side scalar mirrors of the per-layer scales. Populated during extend
+        # (outside CUDA graph capture) so forward_decode can read them without a
+        # device->host .item() call that would fail inside graph capture.
+        self._fp8_k_scale_val_per_layer = [1.0] * num_layers
+        self._fp8_v_scale_val_per_layer = [1.0] * num_layers
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
@@ -1334,19 +1339,20 @@ class AiterAttnBackend(AttentionBackend):
         is_neox = layer._fused_rope_is_neox
         positions = layer._fused_rope_positions[:num_tokens]
 
-        # For SWA layers, get_key_buffer returns the SWA pool (smaller than full).
-        # cache_loc is in full pool space — translate to SWA space so the fused
-        # kernel writes to the correct SWA slot.  Without this, the kernel does
-        # swa_buffer[full_pool_index] → out-of-bounds write → hipErrorIllegalAddress.
-        # NOTE: We index the mapping tensor directly (graph-safe GPU op) instead of
-        # calling translate_loc_from_full_to_swa which has CPU sync in bounds check.
-        if (
-            layer.sliding_window_size is not None
-            and layer.sliding_window_size > -1
-            and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping")
-        ):
-            mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
-            cache_loc = mapping[cache_loc].long()
+        # For SWA layers, we must write into the SWA pool's index space, not the
+        # full pool space that `cache_loc` lives in. Mirror the non-fused
+        # swa_memory_pool.set_kv_buffer path:
+        #   1) if pool.swa_loc is set (piecewise-cuda-graph replay path), use it
+        #      directly — it already is the SWA-space slot mapping.
+        #   2) else translate via full_to_swa_index_mapping on the allocator.
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            pool = forward_batch.token_to_kv_pool
+            swa_loc_override = getattr(pool, "swa_loc", None)
+            if swa_loc_override is not None:
+                cache_loc = swa_loc_override
+            elif hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping"):
+                mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                cache_loc = mapping[cache_loc].long()
 
         # Get KV cache buffers and reshape for flash_layout (block_size=1)
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1368,35 +1374,27 @@ class AiterAttnBackend(AttentionBackend):
         # subsequent extends and all decode steps.
         if self.kv_cache_dtype == fp8_dtype:
             lid = layer.layer_id
-            if is_extend and not self._fp8_scales_calibrated[lid]:
-                # First extend for this layer: compute scale from data.
-                # RoPE is a rotation so magnitudes are preserved; pre-RoPE
-                # absmax is a valid proxy for post-RoPE values.
-                k_absmax = k.abs().amax()
-                v_absmax = v.abs().amax()
-                # Scale so that absmax maps to _fp8_safe_max (400), utilizing
-                # the full FP8 dynamic range.  min=1e-12 prevents div-by-zero
-                # for all-zero tensors.
-                k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
-                v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
-                self._fp8_k_scale_per_layer[lid] = k_scale_new
-                self._fp8_v_scale_per_layer[lid] = v_scale_new
+            # NOTE: dynamic per-layer scale calibration was removed because it
+            # doesn't work under PD disaggregation — prefill calibrates a scale,
+            # but the decode node (which never sees is_extend=True for the
+            # transferred-in prompt) never calibrates and stays at scale=1.0.
+            # The FP8 bytes transferred via mooncake were written with prefill's
+            # scale (~0.0075 for GPT-OSS), so decode reading with scale=1.0
+            # multiplies by 133× and every token after the first decodes to
+            # noise.  Use a fixed scale on both ends.
+            FIXED_SCALE = 1.0 / 48.0  # allows |k|,|v| up to 48 · FP8_safe_max/400 ≈ 5.0
+            if not self._fp8_scales_calibrated[lid]:
+                self._fp8_k_scale_per_layer[lid] = torch.tensor(
+                    FIXED_SCALE, dtype=self._fp8_k_scale_per_layer.dtype,
+                    device=self._fp8_k_scale_per_layer.device,
+                )
+                self._fp8_v_scale_per_layer[lid] = torch.tensor(
+                    FIXED_SCALE, dtype=self._fp8_v_scale_per_layer.dtype,
+                    device=self._fp8_v_scale_per_layer.device,
+                )
+                self._fp8_k_scale_val_per_layer[lid] = FIXED_SCALE
+                self._fp8_v_scale_val_per_layer[lid] = FIXED_SCALE
                 self._fp8_scales_calibrated[lid] = True
-                if lid < 3 or lid == 79:
-                    k_flat = k.abs().flatten().float()
-                    v_flat = v.abs().flatten().float()
-                    k_p99 = torch.quantile(k_flat, 0.99).item()
-                    k_p999 = torch.quantile(k_flat, 0.999).item()
-                    v_p99 = torch.quantile(v_flat, 0.99).item()
-                    v_p999 = torch.quantile(v_flat, 0.999).item()
-                    logger.info(
-                        f"FP8 KV cache: calibrated layer {lid} "
-                        f"k_scale={k_scale_new.item():.6f} v_scale={v_scale_new.item():.6f} "
-                        f"k_absmax={k_absmax.item():.4f} v_absmax={v_absmax.item():.4f} "
-                        f"k_p99={k_p99:.4f} k_p999={k_p999:.4f} "
-                        f"v_p99={v_p99:.4f} v_p999={v_p999:.4f}"
-                    )
-            # Use the (frozen) per-layer scale — a view into the persistent tensor.
             fused_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
             fused_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
         else:
@@ -1416,13 +1414,13 @@ class AiterAttnBackend(AttentionBackend):
             positions,              # (T,) token positions
             cos_cache,              # (max_pos, 1, 1, D//2)
             sin_cache,              # (max_pos, 1, 1, D//2)
-            fused_k_scale,          # k_scale (dynamic for FP8)
-            fused_v_scale,          # v_scale (dynamic for FP8)
+            fused_k_scale,          # k_scale (fixed for PD correctness)
+            fused_v_scale,
             is_neox,
             flash_layout=True,
             apply_scale=(self.kv_cache_dtype == fp8_dtype),
-            q_out=q_3d,            # in-place (same storage as q)
-            k_out=k,               # in-place
+            q_out=q_3d,             # in-place (same storage as q)
+            k_out=k,                # in-place
             output_zeros=False,
         )
 
@@ -1463,26 +1461,30 @@ class AiterAttnBackend(AttentionBackend):
                         is_extend=True,
                     )
                 else:
-                    # Original path: separate RoPE (already applied) + set_kv_buffer
+                    # Original path: separate RoPE (already applied) + set_kv_buffer.
+                    # Use a FIXED shared scale — see the fused path above for
+                    # rationale. Dynamic calibration broke under PD disagg.
                     k_scale_val = None
                     v_scale_val = None
                     if self.kv_cache_dtype == fp8_dtype:
-                        # Compute dynamic scales on GPU, store in per-layer tensors
-                        k_absmax = k.abs().amax()
-                        v_absmax = v.abs().amax()
-                        k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
-                        v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
-                        # Update running max (extend is not graph-captured)
+                        FIXED_SCALE = 1.0 / 48.0
                         lid = layer.layer_id
-                        self._fp8_k_scale_per_layer[lid] = torch.maximum(
-                            self._fp8_k_scale_per_layer[lid], k_scale
-                        )
-                        self._fp8_v_scale_per_layer[lid] = torch.maximum(
-                            self._fp8_v_scale_per_layer[lid], v_scale
-                        )
-                        # .item() OK here — extend path is never graph-captured
-                        k_scale_val = self._fp8_k_scale_per_layer[lid].item()
-                        v_scale_val = self._fp8_v_scale_per_layer[lid].item()
+                        if not self._fp8_scales_calibrated[lid]:
+                            self._fp8_k_scale_per_layer[lid] = torch.tensor(
+                                FIXED_SCALE,
+                                dtype=self._fp8_k_scale_per_layer.dtype,
+                                device=self._fp8_k_scale_per_layer.device,
+                            )
+                            self._fp8_v_scale_per_layer[lid] = torch.tensor(
+                                FIXED_SCALE,
+                                dtype=self._fp8_v_scale_per_layer.dtype,
+                                device=self._fp8_v_scale_per_layer.device,
+                            )
+                            self._fp8_k_scale_val_per_layer[lid] = FIXED_SCALE
+                            self._fp8_v_scale_val_per_layer[lid] = FIXED_SCALE
+                            self._fp8_scales_calibrated[lid] = True
+                        k_scale_val = self._fp8_k_scale_val_per_layer[lid]
+                        v_scale_val = self._fp8_v_scale_val_per_layer[lid]
 
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
@@ -2064,16 +2066,14 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 # Original path (non-fused): use pre-computed per-layer scales
-                # for graph-safe FP8 KV cache write.
+                # for graph-safe FP8 KV cache write. The host-side scalar mirrors
+                # are populated in forward_extend so no device->host sync here.
                 k_scale_val = None
                 v_scale_val = None
                 if self.kv_cache_dtype == fp8_dtype:
-                    # Use scales computed during extend (stored in persistent tensors).
-                    # .item() is safe here only outside graph capture; during capture
-                    # the fused path above is taken instead.
                     lid = layer.layer_id
-                    k_scale_val = self._fp8_k_scale_per_layer[lid].item()
-                    v_scale_val = self._fp8_v_scale_per_layer[lid].item()
+                    k_scale_val = self._fp8_k_scale_val_per_layer[lid]
+                    v_scale_val = self._fp8_v_scale_val_per_layer[lid]
 
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v, k_scale=k_scale_val, v_scale=v_scale_val
@@ -2178,7 +2178,7 @@ class AiterAttnBackend(AttentionBackend):
 
             # Get sinks from kwargs (passed from model for attention sink support)
             sinks = kwargs.get("sinks", None)
-            
+
             # Convert sinks to float32 if provided (kernel expects float32)
             sink_ptr = None
             if sinks is not None:
