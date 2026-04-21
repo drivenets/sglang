@@ -94,6 +94,15 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
+
+def suppress_noisy_warnings() -> None:
+    """Silence noisy upstream warnings. Stub — actual suppression logic
+    was added in an upstream commit that didn't reach this branch."""
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
