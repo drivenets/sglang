@@ -251,6 +251,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         # Track which layers have been calibrated (first-extend scale computation)
         self._fp8_scales_calibrated = [False] * num_layers
+        # Host-side scalar mirrors of the per-layer scales. Populated during extend
+        # (outside CUDA graph capture) so forward_decode can read them without a
+        # device->host .item() call that would fail inside graph capture.
+        self._fp8_k_scale_val_per_layer = [1.0] * num_layers
+        self._fp8_v_scale_val_per_layer = [1.0] * num_layers
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
@@ -2069,35 +2074,27 @@ class AiterAttnBackend(AttentionBackend):
         # subsequent extends and all decode steps.
         if self.kv_cache_dtype == fp8_dtype:
             lid = layer.layer_id
-            if is_extend and not self._fp8_scales_calibrated[lid]:
-                # First extend for this layer: compute scale from data.
-                # RoPE is a rotation so magnitudes are preserved; pre-RoPE
-                # absmax is a valid proxy for post-RoPE values.
-                k_absmax = k.abs().amax()
-                v_absmax = v.abs().amax()
-                # Scale so that absmax maps to _fp8_safe_max (400), utilizing
-                # the full FP8 dynamic range.  min=1e-12 prevents div-by-zero
-                # for all-zero tensors.
-                k_scale_new = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
-                v_scale_new = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
-                self._fp8_k_scale_per_layer[lid] = k_scale_new
-                self._fp8_v_scale_per_layer[lid] = v_scale_new
+            # NOTE: dynamic per-layer scale calibration was removed because it
+            # doesn't work under PD disaggregation — prefill calibrates a scale,
+            # but the decode node (which never sees is_extend=True for the
+            # transferred-in prompt) never calibrates and stays at scale=1.0.
+            # The FP8 bytes transferred via mooncake were written with prefill's
+            # scale (~0.0075 for GPT-OSS), so decode reading with scale=1.0
+            # multiplies by 133× and every token after the first decodes to
+            # noise.  Use a fixed scale on both ends.
+            FIXED_SCALE = 1.0 / 48.0  # allows |k|,|v| up to 48 · FP8_safe_max/400 ≈ 5.0
+            if not self._fp8_scales_calibrated[lid]:
+                self._fp8_k_scale_per_layer[lid] = torch.tensor(
+                    FIXED_SCALE, dtype=self._fp8_k_scale_per_layer.dtype,
+                    device=self._fp8_k_scale_per_layer.device,
+                )
+                self._fp8_v_scale_per_layer[lid] = torch.tensor(
+                    FIXED_SCALE, dtype=self._fp8_v_scale_per_layer.dtype,
+                    device=self._fp8_v_scale_per_layer.device,
+                )
+                self._fp8_k_scale_val_per_layer[lid] = FIXED_SCALE
+                self._fp8_v_scale_val_per_layer[lid] = FIXED_SCALE
                 self._fp8_scales_calibrated[lid] = True
-                if lid < 3 or lid == 79:
-                    k_flat = k.abs().flatten().float()
-                    v_flat = v.abs().flatten().float()
-                    k_p99 = torch.quantile(k_flat, 0.99).item()
-                    k_p999 = torch.quantile(k_flat, 0.999).item()
-                    v_p99 = torch.quantile(v_flat, 0.99).item()
-                    v_p999 = torch.quantile(v_flat, 0.999).item()
-                    logger.info(
-                        f"FP8 KV cache: calibrated layer {lid} "
-                        f"k_scale={k_scale_new.item():.6f} v_scale={v_scale_new.item():.6f} "
-                        f"k_absmax={k_absmax.item():.4f} v_absmax={v_absmax.item():.4f} "
-                        f"k_p99={k_p99:.4f} k_p999={k_p999:.4f} "
-                        f"v_p99={v_p99:.4f} v_p999={v_p999:.4f}"
-                    )
-            # Use the (frozen) per-layer scale — a view into the persistent tensor.
             fused_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
             fused_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
         else:
@@ -2117,13 +2114,13 @@ class AiterAttnBackend(AttentionBackend):
             positions,              # (T,) token positions
             cos_cache,              # (max_pos, 1, 1, D//2)
             sin_cache,              # (max_pos, 1, 1, D//2)
-            fused_k_scale,          # k_scale (dynamic for FP8)
-            fused_v_scale,          # v_scale (dynamic for FP8)
+            fused_k_scale,          # k_scale (fixed for PD correctness)
+            fused_v_scale,
             is_neox,
             flash_layout=True,
             apply_scale=(self.kv_cache_dtype == fp8_dtype),
-            q_out=q_3d,            # in-place (same storage as q)
-            k_out=k,               # in-place
+            q_out=q_3d,             # in-place (same storage as q)
+            k_out=k,                # in-place
             output_zeros=False,
         )
 
