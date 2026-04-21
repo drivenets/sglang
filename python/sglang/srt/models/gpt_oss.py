@@ -568,6 +568,8 @@ class GptOssDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
+        if _timing:
+            ev[1].record()
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -575,10 +577,14 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if _timing:
+            ev[2].record()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        if _timing:
+            ev[3].record()
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -587,6 +593,8 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        if _timing:
+            ev[4].record()
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -595,6 +603,28 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        if _timing:
+            ev[5].record()
+            GptOssDecoderLayer._timer_step += 1
+            if GptOssDecoderLayer._timer_step % GptOssDecoderLayer._timer_log_interval == 0:
+                # Safe outside CUDA graph capture: sync the end event then read.
+                ev[5].synchronize()
+                d = [ev[i].elapsed_time(ev[i + 1]) for i in range(5)]
+                total = sum(d)
+                try:
+                    tp_rank = torch.distributed.get_rank()
+                except Exception:
+                    tp_rank = 0
+                if tp_rank == 0:
+                    print(
+                        f"[L0-TIMING] step={GptOssDecoderLayer._timer_step} "
+                        f"bs={hidden_states.shape[0]} "
+                        f"pre_attn={d[0]:.3f}ms attn={d[1]:.3f}ms "
+                        f"pre_mlp={d[2]:.3f}ms mlp={d[3]:.3f}ms "
+                        f"post={d[4]:.3f}ms total_L0={total:.3f}ms "
+                        f"est_forward_24L={total * self.config.num_hidden_layers:.2f}ms",
+                        flush=True,
+                    )
 
         return hidden_states, residual
 

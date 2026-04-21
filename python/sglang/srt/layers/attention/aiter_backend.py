@@ -304,6 +304,23 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
+    def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
+        """Convert a page_size=1 page_table (token indices) to a real paged table
+        of shape (bs, ceil(max_kv_len/page_size)) holding block indices."""
+        page_size = self.page_size
+        if page_size == 1:
+            return page_table
+        # Cast to int32 before the stride+divide; int64 div_floor is ~40× slower
+        # on ROCm and was dominating decode GPU time (19%) when req_to_token
+        # (which is int64) was fed in unchanged.
+        if page_table.dtype != torch.int32:
+            page_table = page_table.to(torch.int32)
+        max_seqlen_k = page_table.shape[1]
+        strided_indices = torch.arange(
+            0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
+        )
+        return page_table[:, strided_indices] // page_size
+
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
         nhead = self.num_head
         dtype = self.kv_cache_dtype
@@ -1371,6 +1388,8 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map = self.reduce_final_map
                     reduce_partial_map = self.reduce_partial_map
 
+            if max_kv_len is None:
+                max_kv_len = kv_indptr[-1].item() if kv_indptr is not None else 0
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,

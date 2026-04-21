@@ -1166,6 +1166,35 @@ class CudaGraphRunner:
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
+        # Phase-timing: events are baked into the captured graph by gpt_oss.py
+        # and re-timestamped on each replay. Sync + read periodically (one sample
+        # per _timer_log_interval replays; steady state is stable).
+        if os.environ.get('SGLANG_TIME_LAYER0') == '1':
+            from sglang.srt.models.gpt_oss import GptOssDecoderLayer as _GOL
+            _ev = _GOL._timer_events
+            _GOL._timer_step += 1
+            if _GOL._timer_step == 1:
+                print(f"[L0-TIMING] first replay reached; events={_ev is not None} bs={self.bs}", flush=True)
+            if _ev is not None and _GOL._timer_step % _GOL._timer_log_interval == 0:
+                try:
+                    _ev[5].synchronize()
+                    d = [_ev[i].elapsed_time(_ev[i + 1]) for i in range(5)]
+                    total = sum(d)
+                    try:
+                        tp_rank = torch.distributed.get_rank()
+                    except Exception:
+                        tp_rank = 0
+                    if tp_rank == 0:
+                        print(
+                            f"[L0-TIMING] step={_GOL._timer_step} bs={self.bs} "
+                            f"pre_attn={d[0]:.3f}ms attn={d[1]:.3f}ms "
+                            f"pre_mlp={d[2]:.3f}ms mlp={d[3]:.3f}ms "
+                            f"post={d[4]:.3f}ms total_L0={total:.3f}ms",
+                            flush=True,
+                        )
+                except Exception as _e:
+                    print(f"[L0-TIMING] read failed: {_e!r}", flush=True)
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
