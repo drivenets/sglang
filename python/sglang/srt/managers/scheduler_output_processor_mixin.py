@@ -402,6 +402,11 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
+        # Spec-decoding dispatch (re-derived from f401fdf5c which referenced
+        # these without introducing them — downstream commits split on them).
+        is_no_spec = batch.spec_algorithm.is_none() and not batch.is_spec_v2
+        is_spec_v2 = batch.is_spec_v2
+
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
