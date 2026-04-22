@@ -2339,26 +2339,6 @@ class AiterAttnBackend(AttentionBackend):
                         q, k, v, layer, forward_batch, cache_loc,
                         is_extend=True,
                     )
-                    slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
-
-                    launch_reshape_and_cache_flash(
-                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                        k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                        ),
-                        v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                        ),
-                        cache_loc,
-                        (
-                            slot_mapping_swa.long()
-                            if layer.sliding_window_size > 0
-                            else None
-                        ),
-                        k_scale=k_descale,
-                        v_scale=v_descale,
-                    )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
@@ -3004,9 +2984,6 @@ class AiterAttnBackend(AttentionBackend):
                 decode_k_scale = self.k_scale
                 decode_v_scale = self.v_scale
 
-            # Get sinks from kwargs (passed from model for attention sink support)
-            sinks = kwargs.get("sinks", None)
-            
             # Convert sinks to float32 if provided (kernel expects float32)
             sink_ptr = None
             if sinks is not None:
