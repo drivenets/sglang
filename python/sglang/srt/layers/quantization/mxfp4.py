@@ -16,10 +16,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
