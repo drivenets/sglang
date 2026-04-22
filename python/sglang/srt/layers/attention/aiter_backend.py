@@ -1256,9 +1256,12 @@ class AiterAttnBackend(AttentionBackend):
                             self.req_to_token.stride(0),
                         )
                         # Translate full pool indices → SWA pool indices
-                        if hasattr(self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
+                        # Use self.token_to_kv_pool (set when use_sliding_window_kv_pool=True)
+                        # since token_to_kv_pool_allocator isn't an attribute on AiterAttnBackend.
+                        _swa_pool = getattr(self, "token_to_kv_pool", None)
+                        if _swa_pool is not None and hasattr(_swa_pool, "translate_loc_from_full_to_swa"):
                             extend_swa_kv_indices[:extend_swa_total_kv_len] = (
-                                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                                _swa_pool.translate_loc_from_full_to_swa(
                                     extend_swa_kv_indices[:extend_swa_total_kv_len]
                                 )
                             )
