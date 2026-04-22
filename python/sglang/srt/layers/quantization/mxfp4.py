@@ -50,7 +50,7 @@ from sglang.srt.utils import (
     round_up,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.common import get_bool_env_var, log_info_on_rank0
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
