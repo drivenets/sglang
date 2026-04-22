@@ -112,6 +112,13 @@ class ForwardMetadata:
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
+    # Cached extend-path KV indices (from 569ad233c) — shared across all layers
+    extend_full_kv_indptr: Optional[torch.Tensor] = None
+    extend_full_kv_indices: Optional[torch.Tensor] = None
+    extend_full_total_kv_len: Optional[int] = None
+    extend_swa_kv_indptr: Optional[torch.Tensor] = None
+    extend_swa_kv_indices: Optional[torch.Tensor] = None
+    extend_swa_total_kv_len: Optional[int] = None
 
 
 global_workspace_buffer = None
