@@ -2963,52 +2963,27 @@ class AiterAttnBackend(AttentionBackend):
                     k_cache = k_cache.to(self.input_dtype)
                     v_cache = v_cache.to(self.input_dtype)
 
-                # dbe2a9d39: pass learned attention sinks (GPT-OSS) to the
-                # decode kernel. Without this, GPT-OSS produces garbage.
-                sink_ptr = None
-                if sinks is not None:
-                    sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
-
-            # FP8 decode scales: use the frozen per-layer scales that were
-            # calibrated on the first extend.  These are views into a persistent
-            # tensor, so the data_ptr is stable for CUDA graph replay.
-            if self.kv_cache_dtype == fp8_dtype:
-                lid = layer.layer_id
-                decode_k_scale = self._fp8_k_scale_per_layer[lid:lid+1]
-                decode_v_scale = self._fp8_v_scale_per_layer[lid:lid+1]
-            else:
-                decode_k_scale = self.k_scale
-                decode_v_scale = self.v_scale
-
-            # Convert sinks to float32 if provided (kernel expects float32)
-            sink_ptr = None
-            if sinks is not None:
-                if sinks.dtype != torch.float32:
-                    sink_ptr = sinks.to(torch.float32)
-                else:
-                    sink_ptr = sinks
-
-            paged_attention_ragged(
-                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                self.workspace_buffer,
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                self.scale,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.kv_last_page_len,
-                1,
-                self.max_num_partitions,
-                None,
-                "auto",
-                "NHD",
-                self.logits_soft_cap,
-                decode_k_scale,
-                decode_v_scale,
-                None,
-                _AITER_PARTITION_SIZE_ROCM,
-            )
+                paged_attention_ragged(
+                    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    self.workspace_buffer,
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.scale,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.kv_last_page_len,
+                    1,
+                    self.max_num_partitions,
+                    None,
+                    "auto",
+                    "NHD",
+                    self.logits_soft_cap,
+                    self.k_scale,
+                    self.v_scale,
+                    None,
+                    _AITER_PARTITION_SIZE_ROCM,
+                )
 
         return o
 
