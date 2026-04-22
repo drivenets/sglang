@@ -286,6 +286,9 @@ class AiterAttnBackend(AttentionBackend):
         )
         # Track which layers have been calibrated (first-extend scale computation)
         self._fp8_scales_calibrated = [False] * num_layers
+        # CPU-side scalar mirrors of the per-layer scales (avoid .item() syncs in graph path)
+        self._fp8_k_scale_val_per_layer = [1.0] * num_layers
+        self._fp8_v_scale_val_per_layer = [1.0] * num_layers
         # Persistent 1-element buffers for decode attention (never re-allocated)
         self._decode_k_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
         self._decode_v_scale_buf = torch.ones(1, dtype=torch.float32, device=self.device)
