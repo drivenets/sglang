@@ -2331,17 +2331,38 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                # Check if fused RoPE + KV cache write is available
-                _has_fused_rope = (
-                    _has_fused_rope_cache
-                    and hasattr(layer, '_fused_rope_cos')
-                    and not self.use_mla
-                )
-                if _has_fused_rope:
-                    # Fused path: apply RoPE and write to cache in one kernel
-                    self._apply_fused_rope_and_cache(
-                        q, k, v, layer, forward_batch, cache_loc,
-                        is_extend=True,
+                # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
+                # both unified attention and sliding window kv pool are active.
+                # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
+                # use standard set_kv_buffer, as they lack SWA-specific attributes
+                # like full_to_swa_index_mapping.
+                if (
+                    self.use_triton_unified_attention
+                    and self.use_sliding_window_kv_pool
+                ):
+                    token_to_kv_pool = forward_batch.token_to_kv_pool
+                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
+
+                    launch_reshape_and_cache_flash(
+                        k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                        v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        cache_loc,
+                        (
+                            slot_mapping_swa.long()
+                            if layer.sliding_window_size > 0
+                            else None
+                        ),
+                        k_scale=k_descale,
+                        v_scale=v_descale,
                     )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
@@ -2352,7 +2373,6 @@ class AiterAttnBackend(AttentionBackend):
                         v_absmax = v.abs().amax()
                         k_scale = torch.clamp(k_absmax / self._fp8_safe_max_t, min=1e-12)
                         v_scale = torch.clamp(v_absmax / self._fp8_safe_max_t, min=1e-12)
-                        # Update running max (extend is not graph-captured)
                         lid = layer.layer_id
                         self._fp8_k_scale_per_layer[lid] = torch.maximum(
                             self._fp8_k_scale_per_layer[lid], k_scale
