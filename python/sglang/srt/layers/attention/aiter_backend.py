@@ -3008,7 +3008,6 @@ class AiterAttnBackend(AttentionBackend):
                 decode_v_scale,
                 None,
                 _AITER_PARTITION_SIZE_ROCM,
-                sink_ptr=sink_ptr,
             )
 
         return o
