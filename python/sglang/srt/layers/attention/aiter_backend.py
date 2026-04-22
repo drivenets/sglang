@@ -2992,23 +2992,23 @@ class AiterAttnBackend(AttentionBackend):
                 o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 self.workspace_buffer,
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_cache_view.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                v_cache_view.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
+                k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
+                v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
                 self.scale,
-                kv_indptr,
-                kv_indices,
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
                 self.kv_last_page_len,
                 1,
                 self.max_num_partitions,
                 None,
-                kv_cache_dtype_str,
+                "auto",
                 "NHD",
                 self.logits_soft_cap,
-                decode_k_scale,  # Use per-layer dynamic scale
-                decode_v_scale,  # Use per-layer dynamic scale
+                decode_k_scale,
+                decode_v_scale,
                 None,
                 _AITER_PARTITION_SIZE_ROCM,
-                sink_ptr=sink_ptr,  # Pass attention sinks to kernel
+                sink_ptr=sink_ptr,
             )
 
         return o
