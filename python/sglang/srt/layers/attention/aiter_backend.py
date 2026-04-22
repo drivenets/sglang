@@ -63,6 +63,7 @@ except ImportError:
 from sglang.srt.compilation.piecewise_context_manager import is_piecewise_capture_active
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, fp8_max
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
