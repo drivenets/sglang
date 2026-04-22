@@ -260,7 +260,11 @@ class AiterAttnBackend(AttentionBackend):
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
-        if not (self.use_mla or self.use_triton_unified_attention):
+        # Always allocate workspace_buffer — forward_decode's paged_attention_ragged
+        # path needs it even when use_triton_unified_attention is True at init time
+        # (e.g. if a subsequent layer lacks sliding_window_size and falls back to
+        # the paged path).
+        if not self.use_mla:
             self.workspace_buffer = torch.empty(
                 (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
@@ -2678,8 +2682,7 @@ class AiterAttnBackend(AttentionBackend):
                 sliding_window_size = -1
                 window_size = (-1, -1, 0)
 
-                # Extract attention sinks
-                sinks = kwargs.get("sinks", None)
+                # Attention sinks come from the forward_extend `sinks=` arg.
                 sink_ptr = None
                 if sinks is not None:
                     sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
@@ -2724,8 +2727,7 @@ class AiterAttnBackend(AttentionBackend):
                 sliding_window_size = -1
                 window_size = (-1, -1)
 
-                # Extract attention sinks
-                sinks = kwargs.get("sinks", None)
+                # Attention sinks come from the forward_extend `sinks=` arg.
                 sink_ptr = None
                 if sinks is not None:
                     sink_ptr = sinks.to(torch.float32) if sinks.dtype != torch.float32 else sinks
@@ -2771,17 +2773,11 @@ class AiterAttnBackend(AttentionBackend):
                 return o_aiter.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             # ---- Original (non-graph) extend path ----
-            # Determine sliding window settings
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                sliding_window_size = layer.sliding_window_size
-                kv_indptr = self.forward_metadata.window_kv_indptr
-                kv_indices = self.forward_metadata.window_kv_indices
-                window_kv_offsets = self.forward_metadata.window_kv_start_idx
-            else:
-                sliding_window_size = -1
-                kv_indptr = self.forward_metadata.kv_indptr
-                kv_indices = self.forward_metadata.kv_indices
-                window_kv_offsets = None
+            # SWA is passed via the window_size kwarg on mha_batch_prefill_func
+            # (see below) + swa_page_table, matching v1. The previous version
+            # of this block read window_kv_indptr/indices/start_idx from
+            # forward_metadata but those fields were never populated, and
+            # the values are overwritten below anyway — dropping as dead code.
 
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
