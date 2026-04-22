@@ -19,7 +19,12 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 #     should_use_sparse,
 #     sparse_flash_attn_varlen,
 # )
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+    launch_reshape_and_cache_flash,
+    pad_sequence_with_mask,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
