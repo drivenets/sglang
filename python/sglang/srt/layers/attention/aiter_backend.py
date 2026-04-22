@@ -194,6 +194,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
 
+        # Sliding window init (pulled forward from 6cef05cfb which introduces
+        # this attribute on AiterAttnBackend; we apply d7f7cba76 before
+        # 6cef05cfb in our chain, so init it here).
+        self.sliding_window_size = model_runner.sliding_window_size
+
         # Sliding window buffers - needed for models with sliding window attention
         self.window_kv_indptr = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
