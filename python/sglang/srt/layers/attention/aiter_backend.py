@@ -2238,6 +2238,19 @@ class AiterAttnBackend(AttentionBackend):
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
+        # For SWA layers in SWAKVPool, cache_loc is full-pool space and must be
+        # translated to SWA pool space. SWAKVPool.set_kv_buffer does this
+        # automatically in the non-fused path; here the fused kernel bypasses
+        # set_kv_buffer so we translate here.
+        _pool = forward_batch.token_to_kv_pool
+        if isinstance(_pool, SWAKVPool):
+            _, _is_swa = _pool.layers_mapping[layer.layer_id]
+            if _is_swa:
+                if _pool.swa_loc is not None:
+                    cache_loc = _pool.swa_loc
+                elif _pool.full_to_swa_index_mapping is not None:
+                    cache_loc = _pool.translate_loc_from_full_to_swa(cache_loc)
+
         # View as FP8 if KV cache is FP8
         if self.kv_cache_dtype == fp8_dtype:
             k_cache = k_cache.view(self.kv_cache_dtype)
@@ -2330,7 +2343,24 @@ class AiterAttnBackend(AttentionBackend):
 
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+            # If model deferred RoPE to backend (sets layer._fused_rope_cos), apply
+            # it here via the fused kernel. Without this, attention sees unrotated
+            # K/V on these code paths — most prompts still work due to token
+            # co-occurrence dominance but position-sensitive prompts fail.
+            _has_fused_rope = (
+                _has_fused_rope_cache
+                and hasattr(layer, '_fused_rope_cos')
+                and not self.use_mla
+            )
+            if save_kv_cache and _has_fused_rope:
+                self._apply_fused_rope_and_cache(q, k, v, layer, forward_batch, cache_loc)
+                # Fused kernel wrote FP8 cache with _fp8_*_scale_per_layer — attention
+                # dequant must use the SAME scale, not layer.k_scale (default 1.0).
+                if self.kv_cache_dtype == fp8_dtype:
+                    lid = layer.layer_id
+                    k_descale = self._fp8_k_scale_per_layer[lid:lid + 1]
+                    v_descale = self._fp8_v_scale_per_layer[lid:lid + 1]
+            elif save_kv_cache:
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
                 # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2862,7 +2892,26 @@ class AiterAttnBackend(AttentionBackend):
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
             v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
 
-        if save_kv_cache:
+        # If model deferred RoPE to backend, apply via fused kernel and
+        # capture the matching dequant scale for downstream attention.
+        _has_fused_rope_dec = (
+            _has_fused_rope_cache
+            and hasattr(layer, '_fused_rope_cos')
+            and not self.use_mla
+            and k is not None
+        )
+        _cache_loc_dec = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+        if save_kv_cache and _has_fused_rope_dec:
+            self._apply_fused_rope_and_cache(q, k, v, layer, forward_batch, _cache_loc_dec)
+            if self.kv_cache_dtype == fp8_dtype:
+                lid = layer.layer_id
+                k_descale = self._fp8_k_scale_per_layer[lid:lid + 1]
+                v_descale = self._fp8_v_scale_per_layer[lid:lid + 1]
+        elif save_kv_cache:
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
             # both unified attention and sliding window kv pool are active.
             # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2983,13 +3032,25 @@ class AiterAttnBackend(AttentionBackend):
                     k_cache = k_cache.to(self.input_dtype)
                     v_cache = v_cache.to(self.input_dtype)
 
+                # Cache stored as k/scale. Bake k-scale into softmax_scale (scalar
+                # tweak — avoids a whole-cache multiply). V still needs dequant —
+                # apply to output after attention (O(tokens) vs O(cache) work).
+                # Use host-side scalar mirrors (no device->host sync per step).
+                _effective_scale = self.scale
+                _post_scale_v = None
+                if _has_fused_rope_dec and self.kv_cache_dtype == fp8_dtype:
+                    _k_val = self._fp8_k_scale_val_per_layer[layer.layer_id]
+                    _v_val = self._fp8_v_scale_val_per_layer[layer.layer_id]
+                    _effective_scale = self.scale * _k_val
+                    _post_scale_v = _v_val
+
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     self.workspace_buffer,
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
                     v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                    self.scale,
+                    _effective_scale,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
                     self.kv_last_page_len,
@@ -3004,6 +3065,8 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     _AITER_PARTITION_SIZE_ROCM,
                 )
+                if _post_scale_v is not None:
+                    o.mul_(_post_scale_v)
 
         return o
 
