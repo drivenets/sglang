@@ -154,6 +154,14 @@ def _fused_rmsnorm_fp8_per_token_quant(
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
+def _aiter_fused_ar_rmsnorm_supported(*args, **kwargs):
+    # Stub: hand-patch 4140f778c referenced this but never defined it. Returning
+    # False means the aiter fused AR+RMSNorm branch is disabled — which matches
+    # the effective behavior before we fixed the syntax error in this file
+    # (broken import caused fallback to baked-in sglang, which lacks this path).
+    return False
+
+
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
@@ -736,7 +744,7 @@ class LayerCommunicator:
             else 0
         )
 
-        return (
+        if (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
                 or (
