@@ -713,22 +713,16 @@ class GptOssDecoderLayer(nn.Module):
         return output
 
     # ---- TBO ops: async AllReduce for prefill ----
-    # The shape[0]>0 guard was removed: with TBO at high concurrency, a
-    # micro-batch can end up with 0 tokens on some ranks but not others
-    # (e.g., chunked prefill boundary, padding). Conditional AR per rank
-    # then drives AR seqnums out of sync → NCCL collective timeout at the
-    # next AR. Always-issue AR (NCCL handles 0-element no-op cleanly)
-    # guarantees rank consensus on AR count.
     def op_launch_attn_ar(self, state):
         """Launch async AllReduce for attention output on NCCL stream."""
         hidden_states = state.pop("hidden_states_after_attn")
-        if self.attn_tp_size > 1:
+        if self.attn_tp_size > 1 and hidden_states.shape[0] > 0:
             _AsyncAllReduce.launch(hidden_states, state.tbo_subbatch_index or 0)
         state.hidden_states_ar_pending = hidden_states
 
     def op_wait_attn_ar_and_norm(self, state):
         """Wait for attn AllReduce, then apply post_attention_layernorm + residual."""
-        if self.attn_tp_size > 1:
+        if self.attn_tp_size > 1 and state.hidden_states_ar_pending.shape[0] > 0:
             _AsyncAllReduce.wait(state.tbo_subbatch_index or 0)
         hidden_states = state.pop("hidden_states_ar_pending")
         residual = state.pop("residual")
@@ -757,13 +751,13 @@ class GptOssDecoderLayer(nn.Module):
     def op_launch_mlp_ar(self, state):
         """Launch async AllReduce for MoE output on NCCL stream."""
         hidden_states = state.pop("hidden_states_mlp_output")
-        if self.attn_tp_size > 1:
+        if self.attn_tp_size > 1 and hidden_states.shape[0] > 0:
             _AsyncAllReduce.launch(hidden_states, state.tbo_subbatch_index or 0)
         state.hidden_states_mlp_ar_pending = hidden_states
 
     def op_wait_mlp_ar_and_post(self, state):
         """Wait for MoE AllReduce + residual connection for next layer."""
-        if self.attn_tp_size > 1:
+        if self.attn_tp_size > 1 and state.hidden_states_mlp_ar_pending.shape[0] > 0:
             _AsyncAllReduce.wait(state.tbo_subbatch_index or 0)
         hidden_states = state.pop("hidden_states_mlp_ar_pending")
         residual = state.pop("residual_after_norm")
