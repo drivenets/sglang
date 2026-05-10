@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -85,9 +86,21 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
+    # TBO_MAX_NUM_TOKENS / TBO_MAX_NUM_SEQS: gate TBO off when batch is large
+    # enough that the doubled collective-rate causes RCCL on gfx950 to hang.
+    # NCCL+TBO+sync-AR runs cleanly at <=256 in-flight per prefill on 2P1D
+    # but cliffs into a hang at the c=512 mark (memory: tier6-ship 2026-04-27).
+    # Default thresholds are conservative; raise once the underlying RCCL/TBO
+    # interaction at high collective rate is fixed.
+    _max_tokens = int(os.environ.get("TBO_MAX_NUM_TOKENS", "0") or "0")
+    _max_seqs = int(os.environ.get("TBO_MAX_NUM_SEQS", "0") or "0")
+    if _max_tokens > 0 and num_tokens > _max_tokens:
+        return None
     if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
         if len(extend_lens) < 2:
+            return None
+        if _max_seqs > 0 and len(extend_lens) > _max_seqs:
             return None
         idx = _split_extend_seqs(extend_lens)
         # Reject splits that put 0 seqs on either side, or 0 tokens (one seq
