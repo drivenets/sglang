@@ -176,6 +176,13 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
     )
 
 
+def _aiter_fused_ar_rmsnorm_supported(hidden_size: int, dtype: torch.dtype) -> bool:
+    """Check if aiter's fused allreduce+RMSNorm kernel supports the given shape."""
+    pack_size = 16 // dtype.itemsize
+    n_bytes = hidden_size * dtype.itemsize
+    return hidden_size % pack_size == 0 and 16 <= n_bytes <= 32768
+
+
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
