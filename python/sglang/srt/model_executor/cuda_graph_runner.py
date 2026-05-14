@@ -299,6 +299,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+            # DN-FIX: zero padding slots in positions and req_pool_indices to
+            # avoid stale-value OOB reads by RoPE / req_to_token fancy index
+            # during graph replay. Memory: project_cuda_graph_positions_fix.md
+            # — same SIGABRT / amdgpu VM_L2_PROTECTION_FAULT signature.
+            self.positions[raw_num_token : bs * num_tokens_per_bs].zero_()
+            self.req_pool_indices[raw_bs:bs].zero_()
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
