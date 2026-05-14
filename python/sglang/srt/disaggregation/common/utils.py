@@ -24,6 +24,20 @@ class FastQueue:
                 self._cond.wait()
             return self._buf.popleft()
 
+    def drain(self, max_items: int) -> list:
+        """Block until at least one item is available, then drain up to
+        ``max_items`` items without further blocking. Used by the coalescing
+        transfer worker to amortize per-call overhead across multiple chunks
+        when they queue up faster than the worker can drain them.
+        """
+        with self._cond:
+            while not self._buf:
+                self._cond.wait()
+            items = []
+            while self._buf and len(items) < max_items:
+                items.append(self._buf.popleft())
+            return items
+
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
