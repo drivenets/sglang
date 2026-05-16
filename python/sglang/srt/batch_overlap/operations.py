@@ -48,6 +48,15 @@ def execute_overlapped_operations(
     # This allows A's compute to overlap with B's AllReduce and vice versa.
     _ensure_overlap_stream()
 
+    # B's stream must wait for any pending work on the default stream before its
+    # first kernel runs. Without this, B can start reading tensors that were
+    # written by ops queued on the default stream just before this function
+    # (model forward setup, KV-cache writes, etc.) AND PyTorch's caching
+    # allocator can hand B memory that is still being used on the default
+    # stream. Manifests as random GPU memory-access faults under TBO load on
+    # ROCm, masked by HIP_LAUNCH_BLOCKING=1.
+    _overlap_stream.wait_stream(torch.cuda.current_stream())
+
     # Initial stages for A only (on default stream)
     for _ in range(delta_stage):
         executor_a.next()
