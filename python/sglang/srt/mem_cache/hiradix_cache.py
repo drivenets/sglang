@@ -46,6 +46,13 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+# SWAKVPool wraps two MHATokenToKVPool instances (full-attn +
+# sliding-window slices) for models like GPT-OSS that alternate
+# attention types per layer. We accept it in HiRadixCache by
+# attaching the host pool to the full-attn slice — sliding-window
+# layers have bounded reuse by construction and aren't worth
+# tier-2 spillover.
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -93,9 +100,30 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+        elif isinstance(self.kv_cache, SWAKVPool):
+            # Hybrid sliding-window + full-attention models (GPT-OSS,
+            # Gemma-2 style). The KV cache is split into two inner
+            # MHA pools (`full_kv_pool` + `swa_kv_pool`). We tier-2
+            # only the full-attention layers — sliding-window layers
+            # have bounded reuse by construction (KV is dropped
+            # outside the window) so they're poor spillover candidates.
+            #
+            # Storage-backend writes/reads will only see the full-attn
+            # subset of layers, which is what gets reused across
+            # prompts with shared prefixes anyway.
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                self.kv_cache.full_kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
         else:
             raise ValueError(
-                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
+                "HiRadixCache only supports MHA, MLA, NSA (DSA), "
+                "and SWA (hybrid sliding-window + full-attn) models. "
+                f"Got: {type(self.kv_cache).__name__}"
             )
 
         self.tp_group = params.tp_cache_group
