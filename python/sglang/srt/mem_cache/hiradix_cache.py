@@ -101,6 +101,10 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, SWAKVPool):
+            # Expose for scheduler's `_swa_budget_for_req`; tree-level
+            # SWA eviction stays off (`supports_swa()` inherits False),
+            # SWAKVPool handles device-side window eviction itself.
+            self.sliding_window_size = params.sliding_window_size
             # Hybrid sliding-window + full-attention models (GPT-OSS,
             # Gemma-2 style). The KV cache is split into two inner
             # MHA pools (`full_kv_pool` + `swa_kv_pool`). We tier-2
@@ -743,7 +747,6 @@ class HiRadixCache(RadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
-
         operation_id = self.cache_controller.write_storage(
             node.host_value,
             node.key,
@@ -826,6 +829,26 @@ class HiRadixCache(RadixCache):
 
     def evictable_size(self):
         return self.evictable_size_
+
+    def full_evictable_size(self):
+        # SWA-aware leak detector queries this; our SWA path routes
+        # the host tier through full_kv_pool, so cached-prefix slots
+        # land in the full slot allocator and are evictable from there.
+        return self.evictable_size_
+
+    def swa_evictable_size(self):
+        # Same accounting on the SWA side: each cached token occupies
+        # one slot in both pools (per-layer 1:1), so the same evictable
+        # count applies. SWA-window eviction (older-than-window slots
+        # dropped by SWAKVPool itself) is a separate code path that
+        # doesn't pass through the radix tree.
+        return self.evictable_size_
+
+    def full_protected_size(self):
+        return self.protected_size_
+
+    def swa_protected_size(self):
+        return self.protected_size_
 
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
         """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
