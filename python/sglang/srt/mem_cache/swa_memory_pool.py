@@ -367,7 +367,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
-        assert self.page_size == 1
+        # HiCache's load-back path (cache_controller.py:758) calls alloc(N)
+        # where N is a per-page count of tokens. For page_size > 1, the
+        # underlying PagedTokenToKVPoolAllocator.alloc(need_size) returns
+        # token-level indices spanning need_size page-aligned tokens, so
+        # the full→swa mapping below works as long as need_size is a
+        # multiple of page_size — which HiCache guarantees by issuing the
+        # load in page units.
+        if self.page_size > 1 and need_size % self.page_size != 0:
+            return None  # caller bug; reject rather than corrupt mapping
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
