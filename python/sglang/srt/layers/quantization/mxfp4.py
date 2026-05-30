@@ -390,6 +390,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.intermediate_size_per_partition_original = intermediate_size_per_partition  # Before mxfp4_block padding
 
         self.hidden_size = hidden_size
+        # The aiter MoE kernel reads the bias in fp32 (see comment on
+        # `b13=layer.w13_weight_bias  # fp32 per expert per channel`
+        # near the apply() call). Historically we materialised the
+        # param as bf16 here and converted it to fp32 inside
+        # process_weights_after_loading. That conversion is invisible
+        # to SGLang's `RemoteInstanceModelLoader` (P6), which compares
+        # the seed's post-processed dtype against the follower's
+        # freshly-created param BEFORE the byte transfer — and aborts
+        # with `Weight info does not match for ...w13_weight_bias,
+        # expected (N, 4), got (N, 2)`. Declaring the param as fp32
+        # up front aligns both replicas without changing the runtime
+        # data path (the disk weight loader's `.copy_()` casts bf16
+        # safetensors into the fp32 destination automatically).
+        bias_dtype = torch.float32 if _use_aiter else torch.bfloat16
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -419,7 +434,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 layer.num_local_experts,
                 2 * intermediate_size_per_partition_after_pad,
-                dtype=torch.bfloat16,
+                dtype=bias_dtype,
             ),
             requires_grad=False,
         )
@@ -452,7 +467,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+            torch.zeros(layer.num_local_experts, hidden_size, dtype=bias_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_bias", w2_weight_bias)
